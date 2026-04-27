@@ -1,0 +1,680 @@
+import sys
+import cv2
+import numpy as np
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, 
+                             QWidget, QPushButton, QSpinBox, QLineEdit, QSlider,
+                             QGroupBox, QFormLayout, QDoubleSpinBox)
+from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QImage, QPixmap, QFont, QColor
+from pymodbus.client.sync import ModbusTcpClient
+from collections import deque
+
+CAMARA_POR_DEFECTO = 1  # Aquí pones el ID que quieras (0, 1, 2...)
+COORDENADAS_ORIGEN_X = 640//2 #Coordenada inicial de origen (0,0) en px (tanto para X como para Y)
+COORDENADAS_ORIGEN_Y = 480//2 #Coordenada inicial de origen (0,0) en px (tanto para X como para Y)
+FACTOR_PX_MM = 1 #Factor de conversion inicial de px a mm (ajustable desde la HMI)
+
+# --- CLASE PARA EL HILO DE VISIÓN ---
+class VideoThread(QThread):
+    #Creamos una señal personalizada para enviar el frame procesado al hilo principal
+    change_pixmap_signal = pyqtSignal(np.ndarray)
+    #Creamos otra señal para enviar datos de coordenadas, ángulo y color al hilo principal
+    data_signal = pyqtSignal(dict)
+
+    def __init__(self):
+
+        #Seccion de HMI
+        super().__init__()
+        self.running = True
+        self.cap_index = CAMARA_POR_DEFECTO  # Valor por defecto inicial para la cámara
+
+        #Seccion de Vision
+        self.px_to_mm = FACTOR_PX_MM #Factor de conversion de px a mm
+
+        # Coordenadas iniciales del rectángulo de análisis: (x, y, ancho, alto)
+        self.roi_w = 300
+        self.roi_h = 300
+
+        #Origen de coordenadas para el sistema de referencia (0,0)
+        self.origen_x = COORDENADAS_ORIGEN_X
+        self.origen_y = COORDENADAS_ORIGEN_Y
+
+    def set_calibration(self, valor):
+        self.px_to_mm = valor
+
+    def set_roi_size(self, w, h):
+        self.roi_w = w
+        self.roi_h = h
+
+    def set_origin(self, x, y):
+        self.origen_x = x
+        self.origen_y = y
+
+    def detectar_color(self, frame, cnt):
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Crear máscara del contorno
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        cv2.drawContours(mask, [cnt], 0, 255, -1)
+        
+        # Extraer píxeles HSV dentro de la máscara
+        pixels_hsv = hsv_frame[mask == 255]
+        
+        if len(pixels_hsv) == 0:
+            return "Desconocido"
+        
+        # Histograma del Hue y encontrar el pico más frecuente
+        hist = cv2.calcHist([pixels_hsv], [0], None, [180], [0, 180])
+        hue_mode = np.argmax(hist)  # Hue más frecuente
+        
+        # Promedios de Saturation y Value
+        sat = int(np.mean(pixels_hsv[:, 1]))
+        val = int(np.mean(pixels_hsv[:, 2]))
+    
+        # Lógica de rangos (igual)
+        if sat < 40: return "Blanco/Gris"
+        if val < 40: return "Negro"
+        
+        if hue_mode < 10 or hue_mode > 160: return "Rojo"
+        elif 10 <= hue_mode < 25: return "Naranja"
+        elif 25 <= hue_mode < 35: return "Amarillo"
+        elif 35 <= hue_mode < 85: return "Verde"
+        elif 85 <= hue_mode < 130: return "Azul"
+        elif 130 <= hue_mode <= 160: return "Violeta"
+        return "Desconocido"
+    
+    def procesar(self, frame):
+
+        #Inicializamos un diccionario para enviar los datos al hilo principal (HMI)
+        datos={"X_mm": 0, "Y_mm": 0, "Angulo": 0, "Color": "N/A"}
+
+        # 1. Pipeline de procesamiento con visualización
+        #cv2.imshow("Original", frame)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        #cv2.imshow("1. Escala de Grises", gray)
+
+        #hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        #_, s_canal, v_canal = cv2.split(hsv)
+        #cv2.imshow("Saturacion", s_canal)
+        #cv2.imshow("Valor", v_canal)
+
+        #clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        #s_canal_high_contrast = clahe.apply(s_limpio)
+        #cv2.imshow("Clahe", s_canal_high_contrast)
+        
+        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+        #cv2.imshow("2. Desenfoque (Blur)", blurred)
+
+        #s_limpio = cv2.medianBlur(s_canal, 5)
+        #cv2.imshow("2. Mediana (Blur)", s_limpio)
+
+        edged = cv2.Canny(blurred, 50, 150)
+        #cv2.imshow("Canny", edged)
+        edged = cv2.dilate(edged, None, iterations=1)
+        #cv2.imshow("dilate", edged)
+        edged = cv2.erode(edged, None, iterations=1)
+        #cv2.imshow("3. Bordes (Canny)", edged)
+
+        # 2. Referencia de Origen (Circulo en origen)
+        cv2.circle(frame, (self.origen_x, self.origen_y), 5, (0, 0, 255), 2)
+        #cv2.putText(frame, "(0,0)", (self.origen_x - 30, self.origen_y + 3), 
+        #          cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
+
+        #Roi de analisis (Rectangulo)
+        # Calculamos el centro de la imagen real
+        alto, ancho, _ = frame.shape
+        fcx, fcy = ancho // 2, alto // 2
+
+        # Calculamos las esquinas del ROI (creciendo desde el centro)
+        x1 = max(0, fcx - self.roi_w // 2)
+        y1 = max(0, fcy - self.roi_h // 2)
+        x2 = min(ancho, fcx + self.roi_w // 2)
+        y2 = min(alto, fcy + self.roi_h // 2)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        cv2.putText(frame, "ZONA DE ANALISIS", (x1, y1 - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        # 3. Detección de contornos
+        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for cnt in contours:
+            if cv2.contourArea(cnt) < 1000: # Filtro de tamaño
+                continue
+
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                #Centroide del contorno desde el origen del frame
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+
+                # FILTRAR: Solo procesar si está dentro del ROI
+                if not (x1 <= cx <= x1 + self.roi_w and 
+                        y1 <= cy <= y1 + self.roi_h):
+                    continue
+                
+                rect = cv2.minAreaRect(cnt) #Minima area rectangular en la que se puede inscribir el contorno
+                box = cv2.boxPoints(rect)
+                box = np.intp(box)
+
+                (_, _), (_, _), angulo = rect #Obtenemos el ángulo de rotación del rectángulo mínimo (centro xy)(ancho, alto)(angulo)
+                angulo = abs(angulo) #El angulo va desde el punto mas bajo en sentido antohorario
+
+                #Pilexes desde el origen definido (self.origen_X, self.origen_Y)
+                dx_pixeles = cx - self.origen_x
+                dy_pixeles = cy - self.origen_y
+
+                # Convertir a milímetros reales
+                distancia_x_mm = dx_pixeles * self.px_to_mm
+                distancia_y_mm = dy_pixeles * self.px_to_mm
+
+                # Obtener Color
+                color = self.detectar_color(frame, cnt)
+
+                #Dibujammos los resultados en el frame original (frame_inicial)
+                # Dibujar Info
+                cv2.drawContours(frame, [box], 0, (0, 255, 0), 2)
+                cv2.circle(frame, (cx, cy), 3, (255, 0, 0), -1)
+                
+                # Texto junto al objeto
+                '''
+                info_texto = f"X:{distancia_x_mm:.2f} Y:{distancia_y_mm:.2f} A:{angulo:.2f} | {color}"
+                cv2.putText(frame, info_texto, (cx + 20, cy - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                '''
+                datos={"X_mm": distancia_x_mm, "Y_mm": distancia_y_mm, "Angulo": angulo, "Color": color}
+
+        return frame, datos
+
+    def restart_camera(self, new_cam_id):
+        self.running = False # Detenemos el bucle actual
+        self.wait()      # Esperamos a que el sistema libere la cámara anterior
+        self.cap_index = new_cam_id # Guardamos el nuevo ID
+        self.running = True  # Reactivamos
+        self.start()         # Reiniciamos el hilo
+
+    #Ejecucion en paralelo al hilo principal
+    def run(self):
+        try:
+            cap = cv2.VideoCapture(self.cap_index)
+
+            # Verificamos si la cámara realmente abrió
+            if not cap.isOpened():
+                print(f"ERROR: No se pudo acceder a la cámara {self.cap_index}")
+                return # Sale del run y el hilo termina (la pantalla seguirá negra)
+            
+            while self.running:
+                ret, frame = cap.read()
+                if not ret: break # Si la cámara falla, salimos del bucle 
+                
+                frame_procesado, datos = self.procesar(frame)
+                
+                self.change_pixmap_signal.emit(frame_procesado)
+                self.data_signal.emit(datos)
+
+            cap.release() # Liberamos la cámara al finalizar
+
+        except Exception as e: 
+            print(f"Error al acceder a la cámara: {e}")
+
+# --- CLASE PARA EL HILO DE MODBUS ---
+class ModbusThread(QThread):
+    #Señal para avisar a la interfaz si la conexión tuvo éxito o no
+    connection_result = pyqtSignal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self.client = None
+        self.ip = "127.0.0.1"
+        self.port = 502
+        self.is_running = False
+
+        self.n_muestras = 10  # Define qué tan "lento" quieres que reaccione. 5-10 suele ser ideal.
+        self.historial_x = deque(maxlen=self.n_muestras)
+        self.historial_y = deque(maxlen=self.n_muestras)
+        self.historial_ang = deque(maxlen=self.n_muestras)
+
+    def set_config(self, ip, port):
+        self.ip = ip
+        self.port = port
+
+    def run(self):
+        try:
+            self.client = ModbusTcpClient(self.ip, port=self.port)
+            if self.client.connect():
+                self.is_running = True
+                self.connection_result.emit(True)
+                while self.is_running:
+                    # El hilo se mantiene vivo esperando comandos
+                    self.msleep(100) 
+            else:
+                self.connection_result.emit(False)
+        except Exception as e:
+            print(f"Error en hilo Modbus: {e}")
+            self.connection_result.emit(False)
+
+    @pyqtSlot(dict)
+    def enviar_datos(self, datos):
+        """Esta función recibe los datos de la visión y los manda al PLC"""
+        if self.is_running and self.client.is_socket_open():
+            try:
+                # 1. Agregar nuevos valores al historial
+                self.historial_x.append(datos.get('X_mm', 0))
+                self.historial_y.append(datos.get('Y_mm', 0))
+                self.historial_ang.append(datos.get('Angulo', 0))
+
+                # 2. Calcular el promedio de lo que hay en el historial
+                # Usamos len() para evitar división por cero en las primeras lecturas
+                x_prom = sum(self.historial_x) / len(self.historial_x)
+                y_prom = sum(self.historial_y) / len(self.historial_y)
+                ang_prom = sum(self.historial_ang) / len(self.historial_ang)
+
+                # Función para sanitizar: 
+                # 1. Convierte a int. 
+                # 2. Asegura que sea >= 0 (evita negativos).
+                # 3. Asegura que sea <= 65535 (evita desbordamientos).
+                def sanitizar(val):
+                    return max(0, min(int(val*100), 65535))
+                
+                # Escalamos para no perder decimales (ej: 10.55mm -> 1055)
+                x = sanitizar(x_prom)
+                y = sanitizar(y_prom)
+                ang = sanitizar(ang_prom)
+                
+                # Modbus NO entiende strings, así que convertimos el color a un ID
+                color_raw = datos.get('Color', 'Desconocido')
+                # Diccionario de conversión: puedes añadir todos los colores que necesites
+                mapeo_colores = {'Desconocido': 0, 'Blanco/Gris': 1, 'Negro': 2,
+                                  'Rojo': 3, 'Naranja': 4, 'Amarillo': 5, 'Verde': 6,
+                                   'Azul': 7, 'Violeta': 8 }
+                color_id = mapeo_colores.get(color_raw, 0)
+
+                # Escribimos en los registros 0, 1, 2 y 3
+                self.client.write_registers(0, [x, y, ang, color_id])
+                #print("Datos enviados al PLC:")
+                #print(f"  X: {x}, Y: {y}, Ang: {ang}, Color ID: {color_id}")
+            except Exception as e:
+                print(f"Fallo al escribir en PLC: {e}")
+
+    def stop(self):
+        self.is_running = False
+        if self.client:
+            self.client.close()
+        self.quit()
+
+# --- CLASE PRINCIPAL DEL HMI ---
+class RobotHMI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("HMI Control de Calidad - Robot Vision")
+        self.setGeometry(100, 100, 1000, 700) #(x, y, ancho, alto)
+        self.setStyleSheet("background-color: #1e1e1e; color: white;")
+
+        # Layouts
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QHBoxLayout(self.central_widget)
+
+        # 1. Panel de Video (Izquierda)
+        self.video_label = QLabel()
+        self.main_layout.addWidget(self.video_label, stretch=2)
+
+        # 2. Panel de Control (Derecha)
+        self.control_panel = QVBoxLayout()
+
+        # Separador visual
+        separator = QLabel()
+        separator.setFixedHeight(2)
+        separator.setStyleSheet("background-color: #555; margin: 10px 0;")
+        self.control_panel.addWidget(separator)
+
+        # Layout para mostrar coordenadas y estado
+        info_layout = QVBoxLayout()
+
+        self.lbl_cds = QLabel("Coordenadas:")
+        self.lbl_cds.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        info_layout.addWidget(self.lbl_cds)
+
+        self.lbl_x = QLabel("X: 0.00 mm")
+        self.lbl_x.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        info_layout.addWidget(self.lbl_x)
+
+        self.lbl_y = QLabel("Y: 0.00 mm")
+        self.lbl_y.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        info_layout.addWidget(self.lbl_y)
+
+        self.lbl_angulo = QLabel("Θ: 0.00°")
+        self.lbl_angulo.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        info_layout.addWidget(self.lbl_angulo)
+
+        self.lbl_color = QLabel("COLOR: N/A")
+        self.lbl_color.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        info_layout.addWidget(self.lbl_color)
+
+        # Añadir este grupo al panel de control
+        self.control_panel.addLayout(info_layout)
+
+        # Separador visual
+        separator = QLabel()
+        separator.setFixedHeight(2)
+        separator.setStyleSheet("background-color: #555; margin: 10px 0;")
+        self.control_panel.addWidget(separator)
+
+        #Calibrar ROI
+        roi_layout_roi = QVBoxLayout()
+        self.lbl_roi = QLabel("Ajustar ROI:")
+        self.lbl_roi.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        roi_layout_roi.addWidget(self.lbl_roi)
+        
+        roi_layout_ancho = QHBoxLayout()
+        self.lbl_ancho = QLabel("Ancho:")
+        self.lbl_ancho.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        roi_layout_ancho.addWidget(self.lbl_ancho, stretch=1)
+        self.sld_roi_w = QSlider(Qt.Orientation.Horizontal)
+        self.sld_roi_w.setRange(10, 640) # Ancho min y max
+        self.sld_roi_w.setValue(300)
+        roi_layout_ancho.addWidget(self.sld_roi_w, stretch=2)
+
+        roi_layout_alto = QHBoxLayout()
+        self.lbl_alto = QLabel("Alto:")
+        self.lbl_alto.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        roi_layout_alto.addWidget(self.lbl_alto, stretch=1)
+        self.sld_roi_h = QSlider(Qt.Orientation.Horizontal)
+        self.sld_roi_h.setRange(10, 480) # Alto min y max
+        self.sld_roi_h.setValue(300)
+        roi_layout_alto.addWidget(self.sld_roi_h, stretch=2)
+
+        roi_layout_roi.addLayout(roi_layout_ancho)
+        roi_layout_roi.addLayout(roi_layout_alto)
+
+        # Conectamos los sliders a una función
+        self.sld_roi_w.valueChanged.connect(self.actualizar_roi)
+        self.sld_roi_h.valueChanged.connect(self.actualizar_roi)
+
+        # Añadir este grupo al panel de control
+        self.control_panel.addLayout(roi_layout_roi)
+
+        # Separador visual
+        separator = QLabel()
+        separator.setFixedHeight(2)
+        separator.setStyleSheet("background-color: #555; margin: 10px 0;")
+        self.control_panel.addWidget(separator)
+
+        #Calibrar Origen
+        org_layout = QVBoxLayout()
+        self.lbl_origen = QLabel("Ajustar Origen (0,0):")
+        self.lbl_origen.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        org_layout.addWidget(self.lbl_origen)
+
+        org_layout_X = QHBoxLayout()
+        self.lbl_X = QLabel("X:")
+        self.lbl_X.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        org_layout_X.addWidget(self.lbl_X, stretch=1)
+        self.sld_o_posx = QSlider(Qt.Orientation.Horizontal)
+        self.sld_o_posx.setRange(0, 640) # Posicion X min y max
+        self.sld_o_posx.setValue(COORDENADAS_ORIGEN_X)
+        org_layout_X.addWidget(self.sld_o_posx, stretch=2)
+
+        org_layout_Y = QHBoxLayout()
+        self.lbl_Y = QLabel("Y:")
+        self.lbl_Y.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        org_layout_Y.addWidget(self.lbl_Y, stretch=1)
+        self.sld_o_posy = QSlider(Qt.Orientation.Horizontal)
+        self.sld_o_posy.setRange(0, 480) # Posicion Y min y max
+        self.sld_o_posy.setValue(COORDENADAS_ORIGEN_Y)
+        org_layout_Y.addWidget(self.sld_o_posy, stretch=2)
+
+        org_layout.addLayout(org_layout_X)
+        org_layout.addLayout(org_layout_Y)
+
+        # Conectamos los sliders a una función
+        self.sld_o_posx.valueChanged.connect(self.actualizar_origen)
+        self.sld_o_posy.valueChanged.connect(self.actualizar_origen)
+
+        # Añadir este grupo al panel de control
+        self.control_panel.addLayout(org_layout)
+
+        # Separador visual
+        separator = QLabel()
+        separator.setFixedHeight(2)
+        separator.setStyleSheet("background-color: #555; margin: 10px 0;")
+        self.control_panel.addWidget(separator)
+
+        #Layout para seleccionar camara
+        cam_layout = QVBoxLayout()
+        self.lbl_cam = QLabel("Seleccionar Cámara (ID):")
+        self.lbl_cam.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        cam_layout.addWidget(self.lbl_cam)
+
+        select_cam_layout = QHBoxLayout() #Layout horizontal para el SpinBox y el botón
+        # Cuadro para el número de cámara (0, 1, 2...)
+        self.spin_cam = QSpinBox()
+        self.spin_cam.setRange(0, 10) # Rango de 0 a 10 cámaras
+        self.spin_cam.setValue(CAMARA_POR_DEFECTO)
+        self.spin_cam.setWrapping(True)
+        self.spin_cam.setStyleSheet("""
+            QSpinBox {
+                background-color: #333;
+                color: white;
+                padding: 5px;
+                padding-right: 70px;
+            }
+        """)
+        select_cam_layout.addWidget(self.spin_cam)
+
+        # Botón de Actualizar
+        self.btn_update_cam = QPushButton("ACTUALIZAR CÁMARA")
+        self.btn_update_cam.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 8px;")
+        select_cam_layout.addWidget(self.btn_update_cam)
+
+        # Conectar el botón a una función
+        self.btn_update_cam.clicked.connect(self.cambiar_camara)
+
+        # Añadir el layout de selección de cámara al layout principal
+        cam_layout.addLayout(select_cam_layout)
+
+        # Añadir este grupo al panel de control
+        self.control_panel.addLayout(cam_layout)
+
+        # Separador visual
+        separator = QLabel()
+        separator.setFixedHeight(2)
+        separator.setStyleSheet("background-color: #555; margin: 10px 0;")
+        self.control_panel.addWidget(separator)
+
+        #Conversion px a mm
+        fctr_layout = QVBoxLayout()
+        self.lbl_factor = QLabel("Factor de Conversión (px/mm):")
+        self.lbl_factor.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        fctr_layout.addWidget(self.lbl_factor)
+
+        select_fctr_layout = QHBoxLayout() #Layout horizontal para el SpinBox y el botón
+        # Cuadro para el número de cámara (0, 1, 2...)
+        self.spin_factor = QDoubleSpinBox()
+        self.spin_factor.setDecimals(2) # Dos decimales
+        self.spin_factor.setSingleStep(0.01) # Paso de 0.01
+        self.spin_factor.setRange(0.0, 100.0) # Rango de 0 a 100 (ajusta según tus necesidades)
+        self.spin_factor.setValue(FACTOR_PX_MM)
+        self.spin_factor.setStyleSheet("""
+            QDoubleSpinBox {
+                background-color: #333;
+                color: white;
+                padding: 5px;
+                padding-right: 70px;
+            }
+        """)
+        select_fctr_layout.addWidget(self.spin_factor)
+
+        # Botón de Actualizar
+        self.btn_update_fctr = QPushButton("ACTUALIZAR FACTOR")
+        self.btn_update_fctr.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 8px;")
+        select_fctr_layout.addWidget(self.btn_update_fctr)
+
+        # Conectar el botón a una función
+        self.btn_update_fctr.clicked.connect(self.actualizar_factor)
+
+        # Añadir el layout de selección de cámara al layout principal
+        fctr_layout.addLayout(select_fctr_layout)
+
+        # Añadir este grupo al panel de control
+        self.control_panel.addLayout(fctr_layout)
+
+        # Separador visual
+        separator = QLabel()
+        separator.setFixedHeight(2)
+        separator.setStyleSheet("background-color: #555; margin: 10px 0;")
+        self.control_panel.addWidget(separator)
+
+        #Modbus de comunicacion con PLC
+        self.group_modbus = QGroupBox("Comunicación Robot (Modbus TCP)")
+        self.group_modbus.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                font-size: 14px;
+                color: white;
+                
+                /* 1. Aumentamos el margen superior para que el título quepa bien */
+                margin-top: 20px; 
+                
+                /* 2. Definimos un borde para que el título sepa dónde apoyarse */
+                border: 1px solid #3d3d3d; 
+                border-radius: 5px;
+            }
+
+            QGroupBox::title {
+                /* 3. Posicionamos el título dentro del margen que creamos */
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 5px; /* Espacio a los lados del texto */
+            }
+        """)
+        self.layout_modbus = QFormLayout() # Layout tipo formulario (Etiqueta | Entrada)
+
+        # Campos de texto
+        self.txt_ip = QLineEdit("127.0.0.1")
+        self.txt_puerto = QLineEdit("502") 
+
+        # Botón de conexión
+        self.btn_conectar = QPushButton("CONECTAR PLC")
+        self.btn_conectar.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 8px;")
+        self.btn_conectar.setCheckable(True) # Se queda hundido al presionar
+
+        # Indicador de estado (El "LED")
+        self.lbl_status = QLabel("Desconectado")
+        self.lbl_status.setStyleSheet("color: white; background-color: gray; border-radius: 5px; padding: 3px;")
+        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Añadir al layout del grupo
+        self.layout_modbus.addRow("Dirección IP:", self.txt_ip)
+        self.layout_modbus.addRow("Puerto:", self.txt_puerto)
+        self.layout_modbus.addRow(self.btn_conectar)
+        self.layout_modbus.addRow("Estado:", self.lbl_status)
+
+        self.group_modbus.setLayout(self.layout_modbus)
+
+        self.control_panel.addWidget(self.group_modbus)
+
+        self.btn_conectar.clicked.connect(self.toggle_modbus)
+
+        # Separador visual
+        separator = QLabel()
+        separator.setFixedHeight(2)
+        separator.setStyleSheet("background-color: #555; margin: 10px 0;")
+        self.control_panel.addWidget(separator)
+
+        self.control_panel.addStretch() # Espacio flexible para separar secciones
+
+        self.main_layout.addLayout(self.control_panel, stretch=1)
+
+        # Iniciar Hilo de Video
+        self.thread = VideoThread()
+        self.thread.change_pixmap_signal.connect(self.update_image)
+        self.thread.data_signal.connect(self.actualizar_telemetria)
+        self.thread.start()
+
+        # Iniciar Hilo de Modbus
+        self.hilo_modbus = ModbusThread()
+        self.hilo_modbus.connection_result.connect(self.finalizar_conexion_modbus)
+        self.thread.data_signal.connect(self.hilo_modbus.enviar_datos)
+
+    def update_image(self, cv_img):
+        
+        """Convierte imagen de OpenCV a formato de PyQt"""
+        rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        p = qt_img.scaled(640, 480, Qt.AspectRatioMode.KeepAspectRatio)
+        self.video_label.setPixmap(QPixmap.fromImage(p))
+
+    def cambiar_camara(self):
+        #Tomamos el nuevo ID de cámara del SpinBox
+        new_cam_id = self.spin_cam.value()
+        #Reiniamos pantalla camara
+        self.thread.restart_camera(new_cam_id)
+
+    def actualizar_telemetria(self, datos):
+        #Actualizar las etiquetas con los nuevos datos
+        self.lbl_x.setText(f"X: {datos['X_mm']:.2f} mm")
+        self.lbl_y.setText(f"Y: {datos['Y_mm']:.2f} mm")
+        self.lbl_angulo.setText(f"Θ: {datos['Angulo']:.2f}°")
+        self.lbl_color.setText(f"COLOR: {datos['Color']}")
+
+    def actualizar_factor(self):
+        nuevo_factor = self.spin_factor.value()
+        self.thread.set_calibration(nuevo_factor)
+
+    def actualizar_roi(self):
+        ancho = self.sld_roi_w.value()
+        alto = self.sld_roi_h.value()
+        
+        # Enviamos los nuevos tamaños al hilo directamente
+        self.thread.set_roi_size(ancho, alto)
+
+    def actualizar_origen(self):
+        pos_x = self.sld_o_posx.value()
+        pos_y = self.sld_o_posy.value()
+
+        # Enviamos los nuevos orígenes al hilo directamente
+        self.thread.set_origin(pos_x, pos_y)
+
+    def toggle_modbus(self):
+        if self.btn_conectar.isChecked():
+            # 1. Leer valores de los QLineEdits
+            ip_plc = self.txt_ip.text()
+            try:
+                puerto_plc = int(self.txt_puerto.text())
+            except ValueError:
+                self.lbl_status.setText("Puerto Inválido")
+                return
+            
+            # 2. Configurar y arrancar
+            self.hilo_modbus.set_config(ip_plc, puerto_plc)
+            self.hilo_modbus.start()
+            
+            # 3. UI Feedback
+            self.lbl_status.setText("Conectando...")
+            self.lbl_status.setStyleSheet("background-color: orange; color: white; border-radius: 5px;")
+        else:
+            self.hilo_modbus.stop()
+            self.lbl_status.setText("Desconectado")
+            self.lbl_status.setStyleSheet("background-color: gray; color: white; border-radius: 5px;")
+            self.btn_conectar.setText("Conectar PLC")
+
+    def finalizar_conexion_modbus(self, exito):
+        if exito:
+            self.lbl_status.setText("ONLINE")
+            self.lbl_status.setStyleSheet("background-color: green; color: white; border-radius: 5px;")
+            self.btn_conectar.setText("Desconectar")
+        else:
+            self.lbl_status.setText("ERROR")
+            self.lbl_status.setStyleSheet("background-color: red; color: white; border-radius: 5px;")
+            self.btn_conectar.setChecked(False)
+            self.btn_conectar.setText("Reintentar")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = RobotHMI()
+    window.show()
+    sys.exit(app.exec())

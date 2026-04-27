@@ -1,0 +1,173 @@
+import cv2
+import numpy as np
+
+class VisionRobotLocal:
+    def __init__(self):
+        self.px_to_mm = 0.75 #Factor de conversion de px a mm
+
+        # Coordenadas del rectángulo de análisis: (x, y, ancho, alto)
+        self.roi_x = 150
+        self.roi_y = 100
+        self.roi_w = 300
+        self.roi_h = 300
+
+        #Origen de coordenadas para el sistema de referencia (0,0)
+        self.origen_X = self.roi_x
+        self.origen_Y = self.roi_y
+
+    def detectar_color(self, frame, cnt):
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Crear máscara del contorno
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        cv2.drawContours(mask, [cnt], 0, 255, -1)
+        
+        # Extraer píxeles HSV dentro de la máscara
+        pixels_hsv = hsv_frame[mask == 255]
+        
+        if len(pixels_hsv) == 0:
+            return "Desconocido"
+        
+        # Histograma del Hue y encontrar el pico más frecuente
+        hist = cv2.calcHist([pixels_hsv], [0], None, [180], [0, 180])
+        hue_mode = np.argmax(hist)  # Hue más frecuente
+        
+        # Promedios de Saturation y Value
+        sat = int(np.mean(pixels_hsv[:, 1]))
+        val = int(np.mean(pixels_hsv[:, 2]))
+    
+        # Lógica de rangos (igual)
+        if sat < 40: return "Blanco/Gris"
+        if val < 40: return "Negro"
+        
+        if hue_mode < 10 or hue_mode > 160: return "Rojo"
+        elif 10 <= hue_mode < 25: return "Naranja"
+        elif 25 <= hue_mode < 35: return "Amarillo"
+        elif 35 <= hue_mode < 85: return "Verde"
+        elif 85 <= hue_mode < 130: return "Azul"
+        elif 130 <= hue_mode <= 160: return "Violeta"
+        return "Desconocido"
+    
+    def procesar(self, frame):
+
+        '''
+        # alto, ancho, canales (color)
+        h, w, c = frame.shape
+        #Poner un punto justo en el centro de la pantalla
+        centro_x = int(w / 2)
+        centro_y = int(h / 2)
+        cv2.circle(frame, (centro_x, centro_y), 5, (0, 255, 0), 2)
+        '''
+
+        # 1. Pipeline de procesamiento con visualización
+        #cv2.imshow("Original", frame)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        #cv2.imshow("1. Escala de Grises", gray)
+
+        #hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        #_, s_canal, v_canal = cv2.split(hsv)
+        #cv2.imshow("Saturacion", s_canal)
+        #cv2.imshow("Valor", v_canal)
+
+        #clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        #s_canal_high_contrast = clahe.apply(s_limpio)
+        #cv2.imshow("Clahe", s_canal_high_contrast)
+        
+        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+        #cv2.imshow("2. Desenfoque (Blur)", blurred)
+
+        #s_limpio = cv2.medianBlur(s_canal, 5)
+        #cv2.imshow("2. Mediana (Blur)", s_limpio)
+
+        
+
+        edged = cv2.Canny(blurred, 50, 150)
+        #cv2.imshow("Canny", edged)
+        edged = cv2.dilate(edged, None, iterations=1)
+        #cv2.imshow("dilate", edged)
+        edged = cv2.erode(edged, None, iterations=1)
+        #cv2.imshow("3. Bordes (Canny)", edged)
+
+        # 2. Referencia de Origen (Circulo en origen)
+        cv2.circle(frame, (self.origen_X, self.origen_Y), 5, (0, 0, 255), 2)
+        cv2.putText(frame, "(0,0)", (self.origen_X - 30, self.origen_Y + 3), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
+
+        cv2.rectangle(frame, (self.roi_x, self.roi_y), 
+                    (self.roi_x + self.roi_w, self.roi_y + self.roi_h), (0, 255, 255), 2)
+        cv2.putText(frame, "ZONA DE ANALISIS", (self.roi_x, self.roi_y - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        # 3. Detección de contornos
+        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for cnt in contours:
+            if cv2.contourArea(cnt) < 1000: # Filtro de tamaño
+                continue
+
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                #Centroide del contorno desde el origen del frame
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+
+                # FILTRAR: Solo procesar si está dentro del ROI
+                if not (self.roi_x <= cx <= self.roi_x + self.roi_w and 
+                        self.roi_y <= cy <= self.roi_y + self.roi_h):
+                    continue
+                
+                rect = cv2.minAreaRect(cnt) #Minima area rectangular en la que se puede inscribir el contorno
+                box = cv2.boxPoints(rect)
+                box = np.intp(box)
+
+                (_, _), (w, h), angulo = rect
+                angulo = abs(angulo) #El angulo va desde el punto mas bajo en sentido antohorario
+
+                #Pilexes desde el origen definido (self.origen_X, self.origen_Y)
+                dx_pixeles = cx - self.origen_X
+                dy_pixeles = cy - self.origen_Y
+
+                # Convertir a milímetros reales
+                distancia_x_mm = dx_pixeles * self.px_to_mm
+                distancia_y_mm = dy_pixeles * self.px_to_mm
+
+                # Obtener Color
+                color = self.detectar_color(frame, cnt)
+
+                #Dibujammos los resultados en el frame original (frame_inicial)
+                # Dibujar Info
+                cv2.drawContours(frame, [box], 0, (0, 255, 0), 2)
+                cv2.circle(frame, (cx, cy), 3, (255, 0, 0), -1)
+                
+                # Texto
+                info_texto = f"X:{distancia_x_mm:.2f} Y:{distancia_y_mm:.2f} A:{angulo:.2f} | {color}"
+                cv2.putText(frame, info_texto, (cx + 20, cy - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        return frame
+
+def main():
+    detector = VisionRobotLocal()
+    #Tomamos el control de la camara
+    camera = cv2.VideoCapture(1) # Valor de la cámara (0 para la cámara predeterminada)
+
+    if not camera.isOpened():
+        print("Error: No se puede abrir la cámara.")
+        return
+
+    while True:
+        ret, frame = camera.read()
+        if not ret: break
+
+        resultado = detector.procesar(frame)
+        cv2.imshow("Resultado Final", resultado)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    camera.release() #Liberamos la camara al sistema operativo
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

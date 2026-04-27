@@ -1,0 +1,4 @@
+pymodbus
+opencv-python
+numpy
+PyQt6
