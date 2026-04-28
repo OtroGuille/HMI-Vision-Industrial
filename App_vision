@@ -1,11 +1,11 @@
 import sys
 import cv2
 import numpy as np
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, 
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QSizePolicy, QVBoxLayout, QHBoxLayout, 
                              QWidget, QPushButton, QSpinBox, QLineEdit, QSlider,
                              QGroupBox, QFormLayout, QDoubleSpinBox)
 from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QImage, QPixmap, QFont, QColor
+from PyQt6.QtGui import QIcon, QImage, QPixmap, QFont, QColor
 from pymodbus.client.sync import ModbusTcpClient
 from collections import deque
 
@@ -72,15 +72,16 @@ class VideoThread(QThread):
         val = int(np.mean(pixels_hsv[:, 2]))
     
         # Lógica de rangos (igual)
-        if sat < 40: return "Blanco/Gris"
+        if sat < 50: return "Blanco/Gris"
         if val < 40: return "Negro"
         
         if hue_mode < 10 or hue_mode > 160: return "Rojo"
         elif 10 <= hue_mode < 25: return "Naranja"
-        elif 25 <= hue_mode < 35: return "Amarillo"
-        elif 35 <= hue_mode < 85: return "Verde"
+        elif 25 <= hue_mode < 32: return "Amarillo"
+        elif 30 <= hue_mode < 85: return "Verde"
         elif 85 <= hue_mode < 130: return "Azul"
         elif 130 <= hue_mode <= 160: return "Violeta"
+
         return "Desconocido"
     
     def procesar(self, frame):
@@ -89,6 +90,29 @@ class VideoThread(QThread):
         datos={"X_mm": 0, "Y_mm": 0, "Angulo": 0, "Color": "N/A"}
 
         # 1. Pipeline de procesamiento con visualización
+
+        # -------BLOQUE DE CORRECCIÓN DE COLOR--------------
+        # Estos valores son tus "controles de tono".
+        # 1.0 es el valor neutro. 
+        # Si se ve naranja, baja el rojo (r_gain) y sube el azul (b_gain).
+        r_gain = 0.85  # Ajusta este valor (ej: 0.8 a 1.2)
+        g_gain = 0.88  # Casi siempre déjalo en 1.0
+        b_gain = 1.3  # Ajusta este valor (ej: 0.8 a 1.2)
+
+        # Dividimos los canales, aplicamos ganancia y unimos
+        b, g, r = cv2.split(frame)
+        b = cv2.multiply(b, b_gain)
+        g = cv2.multiply(g, g_gain)
+        r = cv2.multiply(r, r_gain)
+        
+        frame_corregido = cv2.merge([b, g, r])
+        frame_corregido = np.clip(frame_corregido, 0, 255).astype(np.uint8)
+        
+        # Ahora 'frame' es el corregido y será constante. 
+        # Esto no destruirá tu detección HSV porque el color es fijo.
+        frame = frame_corregido
+        # --------------------------------------------------
+
         #cv2.imshow("Original", frame)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -230,7 +254,7 @@ class ModbusThread(QThread):
         self.port = 502
         self.is_running = False
 
-        self.n_muestras = 10  # Define qué tan "lento" quieres que reaccione. 5-10 suele ser ideal.
+        self.n_muestras = 15  # Define qué tan "lento" quieres que reaccione. 5-10 suele ser ideal.
         self.historial_x = deque(maxlen=self.n_muestras)
         self.historial_y = deque(maxlen=self.n_muestras)
         self.historial_ang = deque(maxlen=self.n_muestras)
@@ -307,6 +331,8 @@ class ModbusThread(QThread):
 class RobotHMI(QMainWindow):
     def __init__(self):
         super().__init__()
+
+        self.setWindowIcon(QIcon("ojo.jpg"))
         self.setWindowTitle("HMI Control de Calidad - Robot Vision")
         self.setGeometry(100, 100, 1000, 700) #(x, y, ancho, alto)
         self.setStyleSheet("background-color: #1e1e1e; color: white;")
@@ -318,6 +344,9 @@ class RobotHMI(QMainWindow):
 
         # 1. Panel de Video (Izquierda)
         self.video_label = QLabel()
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setMinimumSize(100, 75)
         self.main_layout.addWidget(self.video_label, stretch=2)
 
         # 2. Panel de Control (Derecha)
@@ -605,7 +634,9 @@ class RobotHMI(QMainWindow):
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
         qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        p = qt_img.scaled(640, 480, Qt.AspectRatioMode.KeepAspectRatio)
+        p = qt_img.scaled(self.video_label.size(), 
+                          Qt.AspectRatioMode.KeepAspectRatio, 
+                          Qt.TransformationMode.SmoothTransformation)
         self.video_label.setPixmap(QPixmap.fromImage(p))
 
     def cambiar_camara(self):
