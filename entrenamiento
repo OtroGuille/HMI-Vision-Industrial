@@ -1,0 +1,28 @@
+import os
+from dotenv import load_dotenv
+from roboflow import Roboflow
+
+load_dotenv()
+
+API_KEY = os.getenv("ROBOFLOW_API_KEY")
+
+def download_dataset():
+    # 1. Definir carpeta destino
+    dataset_name = "frutas_verduras"
+    
+    # 2. Verificar si ya existe
+    if os.path.exists(dataset_name):
+        print(f"El dataset '{dataset_name}' ya existe. Saltando descarga.")
+        return
+    
+    # 3. Descargar si no existe
+    print("Dataset no encontrado. Iniciando descarga...")
+    rf = Roboflow(api_key=API_KEY)
+    project = rf.workspace("bryans-workspace-zojwu").project(dataset_name)
+    version = project.version(2)
+    version.download("yolov8")
+    print("Descarga completada con éxito.")
+
+if __name__ == "__main__":
+    download_dataset()
+                    

@@ -1,18 +1,33 @@
 import sys
 import cv2
+from ultralytics import YOLO
 import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QSizePolicy, QVBoxLayout, QHBoxLayout, 
                              QWidget, QPushButton, QSpinBox, QLineEdit, QSlider,
                              QGroupBox, QFormLayout, QDoubleSpinBox)
-from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QIcon, QImage, QPixmap, QFont, QColor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QIcon, QImage, QPixmap
 from pymodbus.client.sync import ModbusTcpClient
 from collections import deque
 
 CAMARA_POR_DEFECTO = 1  # Aquí pones el ID que quieras (0, 1, 2...)
-COORDENADAS_ORIGEN_X = 640//2 #Coordenada inicial de origen (0,0) en px (tanto para X como para Y)
-COORDENADAS_ORIGEN_Y = 480//2 #Coordenada inicial de origen (0,0) en px (tanto para X como para Y)
+COORDENADAS_ORIGEN_X = 100 #Coordenada inicial de origen (0,0) en px (tanto para X como para Y)
+COORDENADAS_ORIGEN_Y = 100 #Coordenada inicial de origen (0,0) en px (tanto para X como para Y)
 FACTOR_PX_MM = 1 #Factor de conversion inicial de px a mm (ajustable desde la HMI)
+MODELO_YOLO = "runs/detect/entrenamiento_frutas_V2/weights/best.pt"
+
+# Estos valores son los "controles de tono".
+# 1.0 es el valor neutro. 
+# Si se ve naranja, baja el rojo (r_gain) y sube el azul (b_gain).
+R_GAIN = 0.85  
+G_GAIN = 0.88  
+B_GAIN = 1.3  
+
+DISTANCIA_CENTROS = 60 # Distancia máxima en píxeles para considerar que la detección de la IA y el contorno son el mismo objeto (ajustable)
+
+PROMEDIO_MEDIDAS = 15 # Número de frames a promediar
+
+PROMEDIO_MEDIDAS_MODBUS = 10 # Número de medidas a promediar antes de enviar al PLC (puede ser igual o diferente al de visión)
 
 # --- CLASE PARA EL HILO DE VISIÓN ---
 class VideoThread(QThread):
@@ -20,6 +35,8 @@ class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
     #Creamos otra señal para enviar datos de coordenadas, ángulo y color al hilo principal
     data_signal = pyqtSignal(dict)
+    #Creamos una señal para enviar el frame al hilo de IA
+    enviar_a_ia_signal = pyqtSignal(np.ndarray)
 
     def __init__(self):
 
@@ -38,6 +55,22 @@ class VideoThread(QThread):
         #Origen de coordenadas para el sistema de referencia (0,0)
         self.origen_x = COORDENADAS_ORIGEN_X
         self.origen_y = COORDENADAS_ORIGEN_Y
+
+        #Variable para almacenar la última lista de detecciones de la IA
+        self.ultima_lista_ia = []
+
+        self.ventana_promedio = PROMEDIO_MEDIDAS # Número de frames a promediar
+        self.objetos_historial = {} # Diccionario: {id: {'x': deque, 'y': deque, 'ang': deque, 'frames_visto': int}}
+        self.next_id = 0
+        self.distancia_max = 50 # Píxeles máximos que se puede mover un objeto entre frames
+        self.historial_x = deque(maxlen=self.ventana_promedio)
+        self.historial_y = deque(maxlen=self.ventana_promedio)
+        self.historial_angulo = deque(maxlen=self.ventana_promedio)
+        self.historial_box = deque(maxlen=self.ventana_promedio)
+
+    def actualizar_lista_ia(self, lista):
+        """Actualiza el buzón con las detecciones más recientes de la IA"""
+        self.ultima_lista_ia = lista
 
     def set_calibration(self, valor):
         self.px_to_mm = valor
@@ -87,57 +120,67 @@ class VideoThread(QThread):
     def procesar(self, frame):
 
         #Inicializamos un diccionario para enviar los datos al hilo principal (HMI)
-        datos={"X_mm": 0, "Y_mm": 0, "Angulo": 0, "Color": "N/A"}
+        datos={"X_mm": 0, "Y_mm": 0, "Angulo": 0, "Color": "N/A", "Tipo": "N/A"}
+
+        '''
+        # --- CAPA A: DIAGNÓSTICO DE IA ---
+        # Si la IA detectó algo, lo dibujamos aunque ingeniería falle
+        if hasattr(self, 'ultima_lista_ia') and self.ultima_lista_ia:
+            for det in self.ultima_lista_ia:
+                ix, iy = det["centro"]
+                # Dibujamos un círculo pequeño donde la IA dice que hay algo
+                cv2.circle(frame, (ix, iy), 20, (255, 255, 0), 2)
+                cv2.putText(frame, f"IA detecto: {det['nombre']}", (ix, iy - 25), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        '''   
+
+        frame_inicial = frame.copy() # Guardamos el frame original para dibujar los resultados al final
 
         # 1. Pipeline de procesamiento con visualización
-
         # -------BLOQUE DE CORRECCIÓN DE COLOR--------------
-        # Estos valores son tus "controles de tono".
-        # 1.0 es el valor neutro. 
-        # Si se ve naranja, baja el rojo (r_gain) y sube el azul (b_gain).
-        r_gain = 0.85  # Ajusta este valor (ej: 0.8 a 1.2)
-        g_gain = 0.88  # Casi siempre déjalo en 1.0
-        b_gain = 1.3  # Ajusta este valor (ej: 0.8 a 1.2)
-
         # Dividimos los canales, aplicamos ganancia y unimos
         b, g, r = cv2.split(frame)
-        b = cv2.multiply(b, b_gain)
-        g = cv2.multiply(g, g_gain)
-        r = cv2.multiply(r, r_gain)
+        b = cv2.multiply(b, B_GAIN)
+        g = cv2.multiply(g, G_GAIN)
+        r = cv2.multiply(r, R_GAIN)
         
         frame_corregido = cv2.merge([b, g, r])
         frame_corregido = np.clip(frame_corregido, 0, 255).astype(np.uint8)
-        
-        # Ahora 'frame' es el corregido y será constante. 
-        # Esto no destruirá tu detección HSV porque el color es fijo.
+        ganancias=frame_corregido.copy() # Guardamos el frame corregido para mostrarlo en el mosaico
         frame = frame_corregido
         # --------------------------------------------------
 
         #cv2.imshow("Original", frame)
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        #gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         #cv2.imshow("1. Escala de Grises", gray)
 
-        #hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        #_, s_canal, v_canal = cv2.split(hsv)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        h_canal, s_canal, v_canal = cv2.split(hsv)
         #cv2.imshow("Saturacion", s_canal)
         #cv2.imshow("Valor", v_canal)
 
         #clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        #s_canal_high_contrast = clahe.apply(s_limpio)
+        #v_canal_high_contrast = clahe.apply(v_canal)
         #cv2.imshow("Clahe", s_canal_high_contrast)
         
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+        blurred = cv2.GaussianBlur(v_canal, (7, 7), 0)
         #cv2.imshow("2. Desenfoque (Blur)", blurred)
 
         #s_limpio = cv2.medianBlur(s_canal, 5)
         #cv2.imshow("2. Mediana (Blur)", s_limpio)
 
         edged = cv2.Canny(blurred, 50, 150)
+        canny=edged
+
+        kernel = np.ones((3, 3), np.uint8)
         #cv2.imshow("Canny", edged)
-        edged = cv2.dilate(edged, None, iterations=1)
+        edged = cv2.dilate(edged, kernel, iterations=4)
+        dilate=edged
         #cv2.imshow("dilate", edged)
-        edged = cv2.erode(edged, None, iterations=1)
+        edged = cv2.erode(edged, kernel, iterations=3)
+        erode=edged
+
         #cv2.imshow("3. Bordes (Canny)", edged)
 
         # 2. Referencia de Origen (Circulo en origen)
@@ -162,7 +205,8 @@ class VideoThread(QThread):
 
         # 3. Detección de contornos
         contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
+        centros_actuales = []
+
         for cnt in contours:
             if cv2.contourArea(cnt) < 1000: # Filtro de tamaño
                 continue
@@ -179,37 +223,129 @@ class VideoThread(QThread):
                     continue
                 
                 rect = cv2.minAreaRect(cnt) #Minima area rectangular en la que se puede inscribir el contorno
-                box = cv2.boxPoints(rect)
-                box = np.intp(box)
-
-                (_, _), (_, _), angulo = rect #Obtenemos el ángulo de rotación del rectángulo mínimo (centro xy)(ancho, alto)(angulo)
+                box=cv2.boxPoints(rect) #Obtenemos los 4 puntos del rectángulo mínimo
+                (_, _), (w, h), angulo = rect #Obtenemos el ángulo de rotación del rectángulo mínimo (centro xy)(ancho, alto)(angulo)
                 angulo = abs(angulo) #El angulo va desde el punto mas bajo en sentido antohorario
 
-                #Pilexes desde el origen definido (self.origen_X, self.origen_Y)
-                dx_pixeles = cx - self.origen_x
-                dy_pixeles = cy - self.origen_y
-
-                # Convertir a milímetros reales
-                distancia_x_mm = dx_pixeles * self.px_to_mm
-                distancia_y_mm = dy_pixeles * self.px_to_mm
-
-                # Obtener Color
-                color = self.detectar_color(frame, cnt)
-
-                #Dibujammos los resultados en el frame original (frame_inicial)
-                # Dibujar Info
-                cv2.drawContours(frame, [box], 0, (0, 255, 0), 2)
-                cv2.circle(frame, (cx, cy), 3, (255, 0, 0), -1)
+                centros_actuales.append({
+                    'x': cx, 'y': cy, 'ang': abs(angulo), 
+                    'cnt': cnt, 'box': box
+                })
+            
+        # --- ASIGNACIÓN DE ID Y PROMEDIO INDEPENDIENTE ---
+        nuevos_historiales = {}
                 
-                # Texto junto al objeto
-                '''
-                info_texto = f"X:{distancia_x_mm:.2f} Y:{distancia_y_mm:.2f} A:{angulo:.2f} | {color}"
-                cv2.putText(frame, info_texto, (cx + 20, cy - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                '''
-                datos={"X_mm": distancia_x_mm, "Y_mm": distancia_y_mm, "Angulo": angulo, "Color": color}
+        for obj in centros_actuales:
+            match_id = None
+            distancia_minima = self.distancia_max
 
-        return frame, datos
+            # Buscar el ID más cercano en el historial previo
+            for obj_id, datos in self.objetos_historial.items():
+                dist = np.sqrt((obj['x'] - datos['x'][-1])**2 + (obj['y'] - datos['y'][-1])**2)
+                if dist < distancia_minima:
+                    match_id = obj_id
+                    distancia_minima = dist
+            
+            if match_id is None:
+                # Objeto Nuevo
+                match_id = self.next_id
+                self.next_id += 1
+                nuevos_historiales[match_id] = {
+                    'x': deque([obj['x']], maxlen=self.ventana_promedio),
+                    'y': deque([obj['y']], maxlen=10), # Sugiero 10 para respuesta rápida
+                    'ang': deque([obj['ang']], maxlen=10),
+                    'box': deque([obj['box']], maxlen=10)
+                }
+            else:
+                # Objeto Existente: Recuperamos el deque y añadimos el nuevo dato
+                nuevos_historiales[match_id] = self.objetos_historial[match_id]
+                nuevos_historiales[match_id]['x'].append(obj['x'])
+                nuevos_historiales[match_id]['y'].append(obj['y'])
+                nuevos_historiales[match_id]['ang'].append(obj['ang'])
+                nuevos_historiales[match_id]['box'].append(obj['box'])
+
+            # 3. Cálculo de Promedios Estables
+            cx_estable = np.mean(nuevos_historiales[match_id]['x'])
+            cy_estable = np.mean(nuevos_historiales[match_id]['y'])
+            ang_estable = np.mean(nuevos_historiales[match_id]['ang'])
+            box_estable = np.intp(np.mean(list(nuevos_historiales[match_id]['box']), axis=0))
+
+            # 4. Conversión de Unidades (Usando los promedios)
+            #Pilexes desde el origen definido (self.origen_X, self.origen_Y)
+            dx_pixeles = int(cx_estable) - self.origen_x
+            dy_pixeles = int(cy_estable) - self.origen_y
+
+            # Convertir a milímetros reales
+            distancia_x_mm = dx_pixeles * self.px_to_mm
+            distancia_y_mm = dy_pixeles * self.px_to_mm
+
+            # 5. Obtener Color
+            color = self.detectar_color(frame, obj['cnt'])
+
+            # 6. Emparejamiento con IA
+            nombre_fruta = "desconocido"
+            distancia_min = DISTANCIA_CENTROS # Radio de búsqueda en píxeles
+
+            for det in self.ultima_lista_ia:
+                ix, iy = det["centro"]
+                # Distancia Euclidiana entre tu centroide y el de la IA
+                dist = ((cx_estable - ix)**2 + (cy_estable - iy)**2)**0.5
+                if dist < distancia_min:
+                    nombre_fruta = det["nombre"]
+                    distancia_min = dist # Nos quedamos con el más cercano
+
+            # 7. Dibujo de resultados
+            cv2.drawContours(frame, [box_estable], 0, (0, 255, 0), 2)
+            cv2.circle(frame, (int(cx_estable), int(cy_estable)), 3, (255, 0, 0), -1)
+            cv2.putText(frame, nombre_fruta, (int(cx_estable) - 20, int(cy_estable) - 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # 8. Preparar datos para enviar a HMI y PLC
+            datos={"X_mm": distancia_x_mm, "Y_mm": distancia_y_mm, "Angulo": ang_estable, "Color": color, "Tipo": nombre_fruta}
+
+        # Final del proceso: Limpiar historial global
+        self.objetos_historial = nuevos_historiales
+
+        
+        ##------------------------------------------------------------------ DEBUG
+        # --- CREAR EL MOSAICO ---
+        # Convertimos todo a 3 canales (BGR) para poder concatenar
+        capa1 = frame_inicial # Original
+        capa2 = ganancias # Corregido
+        capa3 = cv2.cvtColor(v_canal, cv2.COLOR_GRAY2BGR) # Canal V
+        capa4 = cv2.cvtColor(blurred, cv2.COLOR_GRAY2BGR) # Blur
+        capa5 = cv2.cvtColor(canny, cv2.COLOR_GRAY2BGR) # Bordes
+        capa6 = cv2.cvtColor(dilate, cv2.COLOR_GRAY2BGR) # Bordes
+        capa7 = cv2.cvtColor(erode, cv2.COLOR_GRAY2BGR) # Bordes
+        capa8 = frame # Final
+
+
+        # Redimensionamos cada una (ej. 320x240 si tu cámara es 640x480)
+        h, w = frame.shape[:2]
+        nw, nh = w // 2, h // 2
+        
+        r1 = cv2.resize(capa1, (nw, nh))
+        r2 = cv2.resize(capa2, (nw, nh))
+        r3 = cv2.resize(capa3, (nw, nh))
+        r4 = cv2.resize(capa4, (nw, nh))
+        r5 = cv2.resize(capa5, (nw, nh))
+        r6 = cv2.resize(capa6, (nw, nh))
+        r7 = cv2.resize(capa7, (nw, nh))
+        r8 = cv2.resize(capa8, (nw, nh))
+
+        # Pegamos las filas
+        fila_1 = np.hstack((r1, r2))
+        fila_2 = np.hstack((r3, r4))
+        fila_3 = np.hstack((r5, r6))
+        fila_4 = np.hstack((r7, r8))
+
+        # Unimos las filas verticalmente
+        mosaico = np.vstack((fila_1, fila_2, fila_3, fila_4))
+        ##------------------------------------------------------------------
+        
+        #Enviamos mosaico para ver el pipeline y debuguear
+        return mosaico, datos
+        #return frame, datos
 
     def restart_camera(self, new_cam_id):
         self.running = False # Detenemos el bucle actual
@@ -230,8 +366,12 @@ class VideoThread(QThread):
             
             while self.running:
                 ret, frame = cap.read()
-                if not ret: break # Si la cámara falla, salimos del bucle 
-                
+                if not ret: break # Si la cámara falla, salimos del bucle
+
+                # 1. Avisamos a la IA que hay un frame nuevo
+                self.enviar_a_ia_signal.emit(frame)
+
+                # 2. Tu procesamiento de ingeniería
                 frame_procesado, datos = self.procesar(frame)
                 
                 self.change_pixmap_signal.emit(frame_procesado)
@@ -254,7 +394,7 @@ class ModbusThread(QThread):
         self.port = 502
         self.is_running = False
 
-        self.n_muestras = 15  # Define qué tan "lento" quieres que reaccione. 5-10 suele ser ideal.
+        self.n_muestras = PROMEDIO_MEDIDAS_MODBUS  # Define qué tan "lento" quieres que reaccione. 5-10 suele ser ideal.
         self.historial_x = deque(maxlen=self.n_muestras)
         self.historial_y = deque(maxlen=self.n_muestras)
         self.historial_ang = deque(maxlen=self.n_muestras)
@@ -306,18 +446,25 @@ class ModbusThread(QThread):
                 y = sanitizar(y_prom)
                 ang = sanitizar(ang_prom)
                 
-                # Modbus NO entiende strings, así que convertimos el color a un ID
+                # Modbus NO entiende strings, así que convertimos el item a un ID
                 color_raw = datos.get('Color', 'Desconocido')
-                # Diccionario de conversión: puedes añadir todos los colores que necesites
+                tipo_raw = datos.get('Tipo', 'Desconocido')
+                # Diccionario de conversión
+                #Mapeo de colores
                 mapeo_colores = {'Desconocido': 0, 'Blanco/Gris': 1, 'Negro': 2,
                                   'Rojo': 3, 'Naranja': 4, 'Amarillo': 5, 'Verde': 6,
                                    'Azul': 7, 'Violeta': 8 }
                 color_id = mapeo_colores.get(color_raw, 0)
+                #Mapeo de frutas
+                mapeo_tipos = {'Desconocido': 0, 'chayote': 1, 'manzana': 2,
+                                  'tomate': 3, 'zanahoria': 4 }
+                tipo_id = mapeo_tipos.get(tipo_raw, 0)
 
-                # Escribimos en los registros 0, 1, 2 y 3
-                self.client.write_registers(0, [x, y, ang, color_id])
+                # Escribimos en los registros 0, 1, 2, 3 y 4
+                self.client.write_registers(0, [x, y, ang, color_id, tipo_id])
                 #print("Datos enviados al PLC:")
-                #print(f"  X: {x}, Y: {y}, Ang: {ang}, Color ID: {color_id}")
+                #print(f"  X: {x}, Y: {y}, Ang: {ang}, Color ID: {color_id}, Tipo ID: {tipo_id}")
+
             except Exception as e:
                 print(f"Fallo al escribir en PLC: {e}")
 
@@ -326,6 +473,47 @@ class ModbusThread(QThread):
         if self.client:
             self.client.close()
         self.quit()
+
+# --- CLASE PARA EL HILO DE IA ---
+class IAThread(QThread):
+    # Definimos la señal que enviará la lista de detecciones
+    # Cada elemento de la lista será: {'nombre': str, 'centro': (x, y)}
+    deteccion_ia_signal = pyqtSignal(list) 
+
+    def __init__(self):
+        super().__init__()
+        # Cargamos el modelo
+        self.model = YOLO(MODELO_YOLO)
+        self.frame_actual = None
+
+    def procesar_frame(self, frame):
+        """Método que recibe el frame desde el hilo de video"""
+        if not self.isRunning():
+            self.frame_actual = frame.copy() # Usamos .copy() para evitar conflictos de memoria
+            self.start()
+
+    def run(self):
+        """Inferencia asíncrona"""
+        # Aplicamos el filtro de confianza de 0.8 
+        results = self.model.predict(self.frame_actual, conf=0.8, verbose=False)
+        lista_detecciones = []
+
+        if results and len(results[0].boxes) > 0:
+            for box in results[0].boxes:
+                # Obtener nombre de la clase
+                cls = int(box.cls[0])
+                nombre = self.model.names[cls]
+                
+                # Obtener coordenadas del centro (x_centro, y_centro)
+                # xywh devuelve [x_center, y_center, width, height]
+                x_c, y_c, _, _ = box.xywh[0].tolist()
+                
+                lista_detecciones.append({
+                    "nombre": nombre, 
+                    "centro": (int(x_c), int(y_c))
+                })
+        
+        self.deteccion_ia_signal.emit(lista_detecciones)
 
 # --- CLASE PRINCIPAL DEL HMI ---
 class RobotHMI(QMainWindow):
@@ -365,21 +553,25 @@ class RobotHMI(QMainWindow):
         self.lbl_cds.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
         info_layout.addWidget(self.lbl_cds)
 
-        self.lbl_x = QLabel("X: 0.00 mm")
+        self.lbl_x = QLabel("X: 0.0 mm")
         self.lbl_x.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
         info_layout.addWidget(self.lbl_x)
 
-        self.lbl_y = QLabel("Y: 0.00 mm")
+        self.lbl_y = QLabel("Y: 0.0 mm")
         self.lbl_y.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
         info_layout.addWidget(self.lbl_y)
 
-        self.lbl_angulo = QLabel("Θ: 0.00°")
+        self.lbl_angulo = QLabel("Θ: 0.0°")
         self.lbl_angulo.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
         info_layout.addWidget(self.lbl_angulo)
 
         self.lbl_color = QLabel("COLOR: N/A")
         self.lbl_color.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
         info_layout.addWidget(self.lbl_color)
+
+        self.lbl_tipo = QLabel("TIPO: N/A")
+        self.lbl_tipo.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        info_layout.addWidget(self.lbl_tipo)
 
         # Añadir este grupo al panel de control
         self.control_panel.addLayout(info_layout)
@@ -617,15 +809,21 @@ class RobotHMI(QMainWindow):
         self.main_layout.addLayout(self.control_panel, stretch=1)
 
         # Iniciar Hilo de Video
-        self.thread = VideoThread()
-        self.thread.change_pixmap_signal.connect(self.update_image)
-        self.thread.data_signal.connect(self.actualizar_telemetria)
-        self.thread.start()
+        self.hilo_video = VideoThread()
+        self.hilo_video.change_pixmap_signal.connect(self.update_image)
+        self.hilo_video.data_signal.connect(self.actualizar_telemetria)
+        self.hilo_video.start()
 
         # Iniciar Hilo de Modbus
         self.hilo_modbus = ModbusThread()
         self.hilo_modbus.connection_result.connect(self.finalizar_conexion_modbus)
-        self.thread.data_signal.connect(self.hilo_modbus.enviar_datos)
+        self.hilo_video.data_signal.connect(self.hilo_modbus.enviar_datos)
+
+        self.hilo_ia = IAThread()
+        #El video le pasa el frame a la IA
+        self.hilo_video.enviar_a_ia_signal.connect(self.hilo_ia.procesar_frame)
+        #La IA le devuelve la lista de nombres y posiciones al video
+        self.hilo_ia.deteccion_ia_signal.connect(self.hilo_video.actualizar_lista_ia)
 
     def update_image(self, cv_img):
         
@@ -643,32 +841,33 @@ class RobotHMI(QMainWindow):
         #Tomamos el nuevo ID de cámara del SpinBox
         new_cam_id = self.spin_cam.value()
         #Reiniamos pantalla camara
-        self.thread.restart_camera(new_cam_id)
+        self.hilo_video.restart_camera(new_cam_id)
 
     def actualizar_telemetria(self, datos):
         #Actualizar las etiquetas con los nuevos datos
-        self.lbl_x.setText(f"X: {datos['X_mm']:.2f} mm")
-        self.lbl_y.setText(f"Y: {datos['Y_mm']:.2f} mm")
-        self.lbl_angulo.setText(f"Θ: {datos['Angulo']:.2f}°")
+        self.lbl_x.setText(f"X: {datos['X_mm']:.1f} mm")
+        self.lbl_y.setText(f"Y: {datos['Y_mm']:.1f} mm")
+        self.lbl_angulo.setText(f"Θ: {datos['Angulo']:.1f}°")
         self.lbl_color.setText(f"COLOR: {datos['Color']}")
+        self.lbl_tipo.setText(f"TIPO: {datos['Tipo']}")
 
     def actualizar_factor(self):
         nuevo_factor = self.spin_factor.value()
-        self.thread.set_calibration(nuevo_factor)
+        self.hilo_video.set_calibration(nuevo_factor)
 
     def actualizar_roi(self):
         ancho = self.sld_roi_w.value()
         alto = self.sld_roi_h.value()
         
         # Enviamos los nuevos tamaños al hilo directamente
-        self.thread.set_roi_size(ancho, alto)
+        self.hilo_video.set_roi_size(ancho, alto)
 
     def actualizar_origen(self):
         pos_x = self.sld_o_posx.value()
         pos_y = self.sld_o_posy.value()
 
         # Enviamos los nuevos orígenes al hilo directamente
-        self.thread.set_origin(pos_x, pos_y)
+        self.hilo_video.set_origin(pos_x, pos_y)
 
     def toggle_modbus(self):
         if self.btn_conectar.isChecked():

@@ -1,0 +1,15 @@
+names:
+- chayote
+- manzana
+- tomate
+- zanahoria
+nc: 4
+roboflow:
+  license: CC BY 4.0
+  project: frutas_verduras
+  url: https://universe.roboflow.com/bryans-workspace-zojwu/frutas_verduras/dataset/1
+  version: 1
+  workspace: bryans-workspace-zojwu
+test: ../test/images
+train: ../train/images
+val: ../valid/images

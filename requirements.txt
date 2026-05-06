@@ -1,4 +1,7 @@
-pymodbus
+ultralytics
 opencv-python
-numpy
 PyQt6
+pymodbus==2.5.3
+python-dotenv
+roboflow
+numpy

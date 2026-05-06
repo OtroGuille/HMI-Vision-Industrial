@@ -1,0 +1,37 @@
+import cv2
+import time
+import os
+
+# Configuración
+CLASE = "ruido" # Cambia esto para cada fruta
+CARPETA_DATOS = "dataset" # Carpeta donde se guardarán las imágenes
+DISPOSITIVO_CAMARA = 1 # O tu ruta de IP cam
+
+# Crear carpetas si no existen
+ruta_clase = os.path.join(CARPETA_DATOS, CLASE)
+os.makedirs(ruta_clase, exist_ok=True)
+
+cap = cv2.VideoCapture(DISPOSITIVO_CAMARA)
+count = 0
+
+print(f"PULSA 's' PARA GUARDAR FOTO EN: {ruta_clase}")
+print("PULSA 'q' PARA SALIR")
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+
+    cv2.imshow('Captura de Datos', frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('s'):
+        # Guardar imagen con nombre único
+        img_name = os.path.join(ruta_clase, f"{CLASE}_{count}_{int(time.time())}.jpg")
+        cv2.imwrite(img_name, frame)
+        count += 1
+        print(f"Foto {count} guardada: {img_name}")
+    elif key == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

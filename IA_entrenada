@@ -1,0 +1,48 @@
+import cv2
+from ultralytics import YOLO
+import time
+
+# 1. Cargar tu modelo entrenado
+# Asegúrate de que esta ruta sea correcta según tu carpeta 'runs'
+model_path = "runs/detect/entrenamiento_frutas_v2/weights/best.pt"
+model = YOLO(model_path)
+
+# 2. Inicializar la cámara
+# source=0 es usualmente la cámara integrada o la webcam por defecto
+cap = cv2.VideoCapture(1)
+
+if not cap.isOpened():
+    print("Error: No se puede abrir la cámara.")
+    exit()
+
+print("Presiona 'q' para salir de la visualización.")
+
+while True:
+    start_time = time.time() # Para medir FPS
+    
+    # Leer frame
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # 3. Inferencia
+    # conf=0.8 filtra detecciones con menos del 80% de confianza
+    results = model.predict(frame, conf=0.8, verbose=False)
+
+    # 4. Dibujar resultados
+    annotated_frame = results[0].plot()
+
+    # Calcular y mostrar FPS (importante para tu control robótico)
+    fps = 1.0 / (time.time() - start_time)
+    cv2.putText(annotated_frame, f"FPS: {fps:.2f}", (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+    # Mostrar ventana
+    cv2.imshow("Inferencia Tiempo Real", annotated_frame)
+
+    # Salir con 'q'
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

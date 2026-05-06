@@ -1,4 +1,4 @@
-env_vision/
+env_ia/
 __pycache__/
 *.pyc
 .env
