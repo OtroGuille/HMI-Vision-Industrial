@@ -10,6 +10,8 @@ from PyQt6.QtGui import QIcon, QImage, QPixmap
 from pymodbus.client.sync import ModbusTcpClient
 from collections import deque
 
+from objeto_camara import CamaraMarsIndustrial
+
 CAMARA_POR_DEFECTO = 1  # Aquí pones el ID que quieras (0, 1, 2...)
 COORDENADAS_ORIGEN_X = 100 #Coordenada inicial de origen (0,0) en px (tanto para X como para Y)
 COORDENADAS_ORIGEN_Y = 100 #Coordenada inicial de origen (0,0) en px (tanto para X como para Y)
@@ -28,6 +30,9 @@ DISTANCIA_CENTROS = 60 # Distancia máxima en píxeles para considerar que la de
 PROMEDIO_MEDIDAS = 15 # Número de frames a promediar
 
 PROMEDIO_MEDIDAS_MODBUS = 10 # Número de medidas a promediar antes de enviar al PLC (puede ser igual o diferente al de visión)
+
+ROI_ANCHO_INICIAL = 300 # Ancho inicial del ROI de análisis (ajustable desde la HMI)
+ROI_ALTO_INICIAL = 300 # Alto inicial del ROI de análisis (ajustable desde la HMI)
 
 # --- CLASE PARA EL HILO DE VISIÓN ---
 class VideoThread(QThread):
@@ -49,8 +54,8 @@ class VideoThread(QThread):
         self.px_to_mm = FACTOR_PX_MM #Factor de conversion de px a mm
 
         # Coordenadas iniciales del rectángulo de análisis: (x, y, ancho, alto)
-        self.roi_w = 300
-        self.roi_h = 300
+        self.roi_w = ROI_ANCHO_INICIAL
+        self.roi_h = ROI_ALTO_INICIAL
 
         #Origen de coordenadas para el sistema de referencia (0,0)
         self.origen_x = COORDENADAS_ORIGEN_X
@@ -121,6 +126,8 @@ class VideoThread(QThread):
 
         #Inicializamos un diccionario para enviar los datos al hilo principal (HMI)
         datos={"X_mm": 0, "Y_mm": 0, "Angulo": 0, "Color": "N/A", "Tipo": "N/A"}
+
+        frame = cv2.resize(frame, (640, 480))
 
         '''
         # --- CAPA A: DIAGNÓSTICO DE IA ---
@@ -357,15 +364,15 @@ class VideoThread(QThread):
     #Ejecucion en paralelo al hilo principal
     def run(self):
         try:
-            cap = cv2.VideoCapture(self.cap_index)
+            self.camara_mars = CamaraMarsIndustrial()
 
             # Verificamos si la cámara realmente abrió
-            if not cap.isOpened():
-                print(f"ERROR: No se pudo acceder a la cámara {self.cap_index}")
+            if not self.camara_mars.inicializar():
+                print(f"ERROR: No se pudo acceder a la cámara")
                 return # Sale del run y el hilo termina (la pantalla seguirá negra)
             
             while self.running:
-                ret, frame = cap.read()
+                ret, frame = self.camara_mars.obtener_frame()
                 if not ret: break # Si la cámara falla, salimos del bucle
 
                 # 1. Avisamos a la IA que hay un frame nuevo
@@ -377,7 +384,7 @@ class VideoThread(QThread):
                 self.change_pixmap_signal.emit(frame_procesado)
                 self.data_signal.emit(datos)
 
-            cap.release() # Liberamos la cámara al finalizar
+            self.camara_mars.liberar() # Liberamos la cámara al finalizar
 
         except Exception as e: 
             print(f"Error al acceder a la cámara: {e}")
