@@ -12,6 +12,8 @@ from collections import deque
 
 from objeto_camara import CamaraMarsIndustrial
 
+
+
 CAMARA_POR_DEFECTO = 1  # Aquí pones el ID que quieras (0, 1, 2...)
 COORDENADAS_ORIGEN_X = 100 #Coordenada inicial de origen (0,0) en px (tanto para X como para Y)
 COORDENADAS_ORIGEN_Y = 100 #Coordenada inicial de origen (0,0) en px (tanto para X como para Y)
@@ -57,7 +59,7 @@ class VideoThread(QThread):
         self.roi_w = ROI_ANCHO_INICIAL
         self.roi_h = ROI_ALTO_INICIAL
 
-        #Origen de coordenadas para el sistema de referencia (0,0)
+        #Origen de coordenadas para el sistema de referencia (0,0)3
         self.origen_x = COORDENADAS_ORIGEN_X
         self.origen_y = COORDENADAS_ORIGEN_Y
 
@@ -72,6 +74,12 @@ class VideoThread(QThread):
         self.historial_y = deque(maxlen=self.ventana_promedio)
         self.historial_angulo = deque(maxlen=self.ventana_promedio)
         self.historial_box = deque(maxlen=self.ventana_promedio)
+
+        self.factor_luz_offset = 0 # Guarda el desplazamiento del slider (-5 a 5)
+
+    def set_luz_offset(self, valor):
+        """Método seguro para actualizar el offset desde la interfaz gráfica"""
+        self.factor_luz_offset = valor
 
     def actualizar_lista_ia(self, lista):
         """Actualiza el buzón con las detecciones más recientes de la IA"""
@@ -128,6 +136,21 @@ class VideoThread(QThread):
         datos={"X_mm": 0, "Y_mm": 0, "Angulo": 0, "Color": "N/A", "Tipo": "N/A"}
 
         frame = cv2.resize(frame, (640, 480))
+
+        # Multiplicamos el valor del slider por un factor (ej: 15 o 20) para que se note el cambio de brillo real en los píxeles
+        if self.factor_luz_offset != 0:
+            if self.factor_luz_offset > 0:
+                # Si el slider es positivo: aumentamos contraste (alpha) y un poco el brillo (beta)
+                # slider = 5 -> alpha = 1.4 (40% más contraste), beta = 10
+                alpha = 1.0 + (self.factor_luz_offset * 0.08)
+                beta = self.factor_luz_offset * 2
+            else:
+                # Si el slider es negativo: reducimos sutilmente para oscurecer sin empastar
+                alpha = 1.0 + (self.factor_luz_offset * 0.05)
+                beta = self.factor_luz_offset * 3
+
+            # Aplicamos la ecuación clásica: Nuevo_Píxel = alpha * Píxel + beta
+            frame = cv2.convertScaleAbs(frame, alpha=alpha, beta=beta)
 
         '''
         # --- CAPA A: DIAGNÓSTICO DE IA ---
@@ -397,7 +420,7 @@ class ModbusThread(QThread):
     def __init__(self):
         super().__init__()
         self.client = None
-        self.ip = "127.0.0.1"
+        self.ip = "192.168.2.17"
         self.port = 502
         self.is_running = False
 
@@ -406,6 +429,7 @@ class ModbusThread(QThread):
         self.historial_y = deque(maxlen=self.n_muestras)
         self.historial_ang = deque(maxlen=self.n_muestras)
 
+        
     def set_config(self, ip, port):
         self.ip = ip
         self.port = port
@@ -669,41 +693,50 @@ class RobotHMI(QMainWindow):
         separator.setStyleSheet("background-color: #555; margin: 10px 0;")
         self.control_panel.addWidget(separator)
 
-        #Layout para seleccionar camara
-        cam_layout = QVBoxLayout()
-        self.lbl_cam = QLabel("Seleccionar Cámara (ID):")
-        self.lbl_cam.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
-        cam_layout.addWidget(self.lbl_cam)
+        luz_layout = QVBoxLayout()
+        self.lbl_luz = QLabel("Ganancia de Luz:")
+        self.lbl_luz.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        luz_layout.addWidget(self.lbl_luz)
 
-        select_cam_layout = QHBoxLayout() #Layout horizontal para el SpinBox y el botón
-        # Cuadro para el número de cámara (0, 1, 2...)
-        self.spin_cam = QSpinBox()
-        self.spin_cam.setRange(0, 10) # Rango de 0 a 10 cámaras
-        self.spin_cam.setValue(CAMARA_POR_DEFECTO)
-        self.spin_cam.setWrapping(True)
-        self.spin_cam.setStyleSheet("""
-            QSpinBox {
-                background-color: #333;
-                color: white;
-                padding: 5px;
-                padding-right: 70px;
-            }
-        """)
-        select_cam_layout.addWidget(self.spin_cam)
+        self.sld_luz = QSlider(Qt.Orientation.Horizontal)
+        self.sld_luz.setRange(-5, 10) 
+        self.sld_luz.setValue(0) 
+        luz_layout.addWidget(self.sld_luz)
 
-        # Botón de Actualizar
-        self.btn_update_cam = QPushButton("ACTUALIZAR CÁMARA")
-        self.btn_update_cam.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 8px;")
-        select_cam_layout.addWidget(self.btn_update_cam)
-
-        # Conectar el botón a una función
-        self.btn_update_cam.clicked.connect(self.cambiar_camara)
-
-        # Añadir el layout de selección de cámara al layout principal
-        cam_layout.addLayout(select_cam_layout)
+        #conectamos el slider a una función
+        self.sld_luz.valueChanged.connect(self.cambiar_luminosidad)
 
         # Añadir este grupo al panel de control
-        self.control_panel.addLayout(cam_layout)
+        self.control_panel.addLayout(luz_layout)
+
+        # Separador visual
+        separator = QLabel()
+        separator.setFixedHeight(2)
+        separator.setStyleSheet("background-color: #555; margin: 10px 0;")
+        self.control_panel.addWidget(separator)
+
+        #Layout para seleccionar camara
+        posRobot_layout = QVBoxLayout()
+        self.lbl_poRobot = QLabel("Posición Actual del Robot")
+        self.lbl_poRobot.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
+        posRobot_layout.addWidget(self.lbl_poRobot)
+
+        # Creamos las etiquetas para mostrar los mm en tiempo real
+        self.lbl_robot_x = QLabel("RX: 0.00 mm")
+        self.lbl_robot_y = QLabel("RY: 0.00 mm")
+        self.lbl_robot_z = QLabel("RZ: 0.00 mm")
+
+        # Aplicamos un estilo limpio y visible para entorno industrial
+        estilo_coordenadas = "font-size: 14px; font-weight: bold; color: white; margin-top: 5px;"
+        self.lbl_robot_x.setStyleSheet(estilo_coordenadas)
+        self.lbl_robot_y.setStyleSheet(estilo_coordenadas)
+        self.lbl_robot_z.setStyleSheet(estilo_coordenadas)
+        posRobot_layout.addWidget(self.lbl_robot_x)
+        posRobot_layout.addWidget(self.lbl_robot_y)
+        posRobot_layout.addWidget(self.lbl_robot_z)
+
+        # Añadir este grupo al panel de control
+        self.control_panel.addLayout(posRobot_layout)
 
         # Separador visual
         separator = QLabel()
@@ -780,7 +813,7 @@ class RobotHMI(QMainWindow):
         self.layout_modbus = QFormLayout() # Layout tipo formulario (Etiqueta | Entrada)
 
         # Campos de texto
-        self.txt_ip = QLineEdit("127.0.0.1")
+        self.txt_ip = QLineEdit("198.162.2.17")
         self.txt_puerto = QLineEdit("502") 
 
         # Botón de conexión
@@ -810,9 +843,7 @@ class RobotHMI(QMainWindow):
         separator.setFixedHeight(2)
         separator.setStyleSheet("background-color: #555; margin: 10px 0;")
         self.control_panel.addWidget(separator)
-
         self.control_panel.addStretch() # Espacio flexible para separar secciones
-
         self.main_layout.addLayout(self.control_panel, stretch=1)
 
         # Iniciar Hilo de Video
@@ -909,6 +940,18 @@ class RobotHMI(QMainWindow):
             self.lbl_status.setStyleSheet("background-color: red; color: white; border-radius: 5px;")
             self.btn_conectar.setChecked(False)
             self.btn_conectar.setText("Reintentar")
+
+    def cambiar_luminosidad(self, valor):
+        """Captura el movimiento del slider, actualiza el texto en HMI y lo envía al hilo"""
+        # Actualizamos la etiqueta de la HMI para dar feedback al operador
+        if valor > 0:
+            self.lbl_luz.setText(f"Ganancia de Luz: +{valor}")
+        else:
+            self.lbl_luz.setText(f"Ganancia de Luz: {valor}")
+        
+        # Enviamos el offset al hilo de video en tiempo real si está corriendo
+        if hasattr(self, 'hilo_video') and self.hilo_video.isRunning():
+            self.hilo_video.set_luz_offset(valor)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
