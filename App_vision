@@ -7,12 +7,17 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QSizePolicy, QVB
                              QGroupBox, QFormLayout, QDoubleSpinBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QIcon, QImage, QPixmap
-from pymodbus.client.sync import ModbusTcpClient
 from collections import deque
 
 from objeto_camara import CamaraMarsIndustrial
 
+import struct
+from collections import deque
+from pyModbusTCP.client import ModbusClient
 
+import time
+
+import gc  # Garbage Collector nativo de Python
 
 CAMARA_POR_DEFECTO = 1  # Aquí pones el ID que quieras (0, 1, 2...)
 COORDENADAS_ORIGEN_X = 100 #Coordenada inicial de origen (0,0) en px (tanto para X como para Y)
@@ -31,7 +36,7 @@ DISTANCIA_CENTROS = 60 # Distancia máxima en píxeles para considerar que la de
 
 PROMEDIO_MEDIDAS = 15 # Número de frames a promediar
 
-PROMEDIO_MEDIDAS_MODBUS = 10 # Número de medidas a promediar antes de enviar al PLC (puede ser igual o diferente al de visión)
+PROMEDIO_MEDIDAS_MODBUS = 20 # Número de medidas a promediar antes de enviar al PLC (puede ser igual o diferente al de visión)
 
 ROI_ANCHO_INICIAL = 300 # Ancho inicial del ROI de análisis (ajustable desde la HMI)
 ROI_ALTO_INICIAL = 300 # Alto inicial del ROI de análisis (ajustable desde la HMI)
@@ -134,8 +139,6 @@ class VideoThread(QThread):
 
         #Inicializamos un diccionario para enviar los datos al hilo principal (HMI)
         datos={"X_mm": 0, "Y_mm": 0, "Angulo": 0, "Color": "N/A", "Tipo": "N/A"}
-
-        frame = cv2.resize(frame, (640, 480))
 
         # Multiplicamos el valor del slider por un factor (ej: 15 o 20) para que se note el cambio de brillo real en los píxeles
         if self.factor_luz_offset != 0:
@@ -336,7 +339,7 @@ class VideoThread(QThread):
         # Final del proceso: Limpiar historial global
         self.objetos_historial = nuevos_historiales
 
-        
+        '''
         ##------------------------------------------------------------------ DEBUG
         # --- CREAR EL MOSAICO ---
         # Convertimos todo a 3 canales (BGR) para poder concatenar
@@ -374,8 +377,25 @@ class VideoThread(QThread):
         ##------------------------------------------------------------------
         
         #Enviamos mosaico para ver el pipeline y debuguear
-        return mosaico, datos
-        #return frame, datos
+        #return mosaico, datos
+        '''
+
+        variables_a_borrar = [
+            'frame_inicial', 'frame_corregido', 'ganancias', 
+            'b', 'g', 'r', 'hsv', 'h_canal', 's_canal', 'v_canal', 
+            'blurred', 'edged', 'canny', 'dilate', 'erode',
+            'capa1', 'capa2', 'capa3', 'capa4', 'capa5', 'capa6', 'capa7', 'capa8',
+            'r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r7', 'r8', 'fila_1', 'fila_2', 'fila_3', 'fila_4'
+        ]
+        
+        for var in variables_a_borrar:
+            if var in locals():
+                del locals()[var]
+
+        # 2. Forzamos al recolector de basura a liberar la RAM de inmediato en este ciclo
+        gc.collect()
+
+        return frame, datos
 
     def restart_camera(self, new_cam_id):
         self.running = False # Detenemos el bucle actual
@@ -394,9 +414,20 @@ class VideoThread(QThread):
                 print(f"ERROR: No se pudo acceder a la cámara")
                 return # Sale del run y el hilo termina (la pantalla seguirá negra)
             
+            # Contador para saltar frames si la cámara es demasiado rápida (Ej: procesar 1 de cada 3 frames)
+            contador_frames = 0
+
             while self.running:
-                ret, frame = self.camara_mars.obtener_frame()
+                ret, frame_raw = self.camara_mars.obtener_frame()
                 if not ret: break # Si la cámara falla, salimos del bucle
+
+                contador_frames += 1
+                if contador_frames % 2 != 0:  # <─── Descarta el 50% de los frames entrantes de la Mars
+                    del frame_raw           # Libera inmediatamente el frame duplicado
+                    continue
+
+                frame = cv2.resize(frame_raw, (640, 480), interpolation=cv2.INTER_AREA)
+                del frame_raw # Liberamos el frame original de la cámara para no saturar la memoria
 
                 # 1. Avisamos a la IA que hay un frame nuevo
                 self.enviar_a_ia_signal.emit(frame)
@@ -407,6 +438,9 @@ class VideoThread(QThread):
                 self.change_pixmap_signal.emit(frame_procesado)
                 self.data_signal.emit(datos)
 
+                del frame
+                del frame_procesado
+
             self.camara_mars.liberar() # Liberamos la cámara al finalizar
 
         except Exception as e: 
@@ -414,8 +448,11 @@ class VideoThread(QThread):
 
 # --- CLASE PARA EL HILO DE MODBUS ---
 class ModbusThread(QThread):
-    #Señal para avisar a la interfaz si la conexión tuvo éxito o no
+    # Señal para avisar a la interfaz si la conexión tuvo éxito o no
     connection_result = pyqtSignal(bool)
+    
+    # SEÑAL PARA EL HMI: Emite la posición actual en tiempo real hacia las etiquetas que creaste
+    posicion_actual_hmi_signal = pyqtSignal(dict)
 
     def __init__(self):
         super().__init__()
@@ -424,80 +461,169 @@ class ModbusThread(QThread):
         self.port = 502
         self.is_running = False
 
-        self.n_muestras = PROMEDIO_MEDIDAS_MODBUS  # Define qué tan "lento" quieres que reaccione. 5-10 suele ser ideal.
+        # Historial para el suavizado del cálculo de la cámara
+        # Nota: Asegúrate de que PROMEDIO_MEDIDAS_MODBUS esté definido en tus constantes arriba
+        self.n_muestras = PROMEDIO_MEDIDAS_MODBUS  
         self.historial_x = deque(maxlen=self.n_muestras)
         self.historial_y = deque(maxlen=self.n_muestras)
-        self.historial_ang = deque(maxlen=self.n_muestras)
+        self.historial_z = deque(maxlen=self.n_muestras)
 
+        # ─────────────────────────────────────────────
+        # DIRECCIONES DE MEMORIA (Fórmula SZGH: Registro = 2 * GV)
+        # ─────────────────────────────────────────────
+        # LECTURA: Coordenadas actuales reales del robot (GV206, GV207, GV208)
+        self.REG_LEER_POS_START = 412  # 2 * 206 = Registro 412 (Lee X, Y, Z de una sola ráfaga)
         
+        # ESCRITURA: Variables de destino absoluto para tu bucle del robot (GV1, GV2, GV3)
+        self.REG_WRITE_X = 2  # GV1 = Registros 2 y 3
+        self.REG_WRITE_Y = 4  # GV2 = Registros 4 y 5
+        self.REG_WRITE_Z = 6  # GV3 = Registros 6 y 7
+
+        # Memoria interna del hilo para guardar el último punto mecánico conocido
+        self.robot_x_actual = 0.0
+        self.robot_y_actual = 0.0
+        self.robot_z_actual = 0.0
+
+        self.ultimo_envio_time = 0.0  # Registra el tiempo del último paquete enviado
+
     def set_config(self, ip, port):
         self.ip = ip
         self.port = port
-
+    
     def run(self):
+        """Bucle cíclico que lee la posición física del robot y actualiza el HMI"""
         try:
-            self.client = ModbusTcpClient(self.ip, port=self.port)
-            if self.client.connect():
+            # Conexión limpia usando pyModbusTCP
+            self.client = ModbusClient(host=self.ip, port=self.port, unit_id=1, auto_open=True)
+            if self.client.open():
                 self.is_running = True
                 self.connection_result.emit(True)
+                
                 while self.is_running:
-                    # El hilo se mantiene vivo esperando comandos
-                    self.msleep(100) 
+                    # Leemos 6 registros consecutivos de retención (Holding Registers)
+                    # Cada coordenada Float de 32 bits ocupa 2 registros. (3 variables * 2 = 6 regs)
+                    regs = self.client.read_holding_registers(self.REG_LEER_POS_START, 6)
+                    
+                    if regs and len(regs) == 6:
+                        # Desempaquetar X (GV206)
+                        raw_x = struct.pack('<HH', regs[0], regs[1])
+                        self.robot_x_actual = struct.unpack('<f', raw_x)[0]
+                        
+                        # Desempaquetar Y (GV207)
+                        raw_y = struct.pack('<HH', regs[2], regs[3])
+                        self.robot_y_actual = struct.unpack('<f', raw_y)[0]
+                        
+                        # Desempaquetar Z (GV208)
+                        raw_z = struct.pack('<HH', regs[4], regs[5])
+                        self.robot_z_actual = struct.unpack('<f', raw_z)[0]
+
+                        # Preparamos el diccionario limpio para la interfaz gráfica
+                        dict_pos = {
+                            'X': round(self.robot_x_actual, 2),
+                            'Y': round(self.robot_y_actual, 2),
+                            'Z': round(self.robot_z_actual, 2)
+                        }
+                        # Disparamos los datos hacia la HMI
+                        self.posicion_actual_hmi_signal.emit(dict_pos)
+                    
+                    self.msleep(100)  # Muestreo a 10Hz, óptimo para no saturar la CPU del SZGH
             else:
                 self.connection_result.emit(False)
         except Exception as e:
-            print(f"Error en hilo Modbus: {e}")
+            print(f"Error en bucle de telemetría Modbus: {e}")
             self.connection_result.emit(False)
-
+    
+    def _convertir_a_palabras_float(self, valor):
+        """Convierte un float de Python a dos palabras de 16 bits (Low word primero)"""
+        raw = struct.pack('<f', float(valor))
+        low  = struct.unpack('<H', raw[0:2])[0]
+        high = struct.unpack('<H', raw[2:4])[0]
+        return [low, high]
+    
     @pyqtSlot(dict)
     def enviar_datos(self, datos):
-        """Esta función recibe los datos de la visión y los manda al PLC"""
-        if self.is_running and self.client.is_socket_open():
+        """Recibe el desfasaje de la cámara, efectúa la suma y escribe el destino absoluto"""
+        if self.is_running and self.client.is_open:
             try:
-                # 1. Agregar nuevos valores al historial
-                self.historial_x.append(datos.get('X_mm', 0))
-                self.historial_y.append(datos.get('Y_mm', 0))
-                self.historial_ang.append(datos.get('Angulo', 0))
+                #Borra el historial para pruebas manuales
+                #self.historial_x.clear()
+                #self.historial_y.clear()
+                #self.historial_z.clear()
+                #Desactivar cuando sea el caso real
 
-                # 2. Calcular el promedio de lo que hay en el historial
-                # Usamos len() para evitar división por cero en las primeras lecturas
+                # ─── CONTROL DE VELOCIDAD (THROTTLE) ───
+                tiempo_actual = time.time()
+                # 0.100 segundos significa que solo se permite enviar datos cada 100ms (10 veces por segundo)
+                if (tiempo_actual - self.ultimo_envio_time) < 0.100:
+                    return  # Ignora este frame y limpia la cola de PyQt de inmediato
+
+
+                # Extraemos el error en mm calculado por tu algoritmo de visión en el ROI
+                desfase_x = datos.get('X_mm', 0.0)
+                desfase_y = datos.get('Y_mm', 0.0)
+                desfase_z = datos.get('Z_mm', 0.0)  
+
+                # Si es un frame vacío sin detecciones reales, no enviamos comandos de movimiento
+                if desfase_x == 0.0 and desfase_y == 0.0 and desfase_z == 0.0:
+                    return
+
+                # FÓRMULA DE CONTROL: Destino Absoluto = Posición Física Actual + Desfase de la Fruta
+                #x_destino = self.robot_x_actual + desfase_x
+                #y_destino = self.robot_y_actual + desfase_y
+                #z_destino = self.robot_z_actual
+
+                k=0.3
+
+                x_destino = 716.7
+                y_destino = 151.79+desfase_x*k
+                #z_destino = 209.5 + desfase_z 
+                z_destino = 300-desfase_y*k
+
+                self.historial_x.clear()
+                self.historial_y.clear()
+                self.historial_z.clear()
+
+                # Aplicamos el filtro de promedio móvil para suavizar picos de ruido
+                self.historial_x.append(x_destino)
+                self.historial_y.append(y_destino)
+                self.historial_z.append(z_destino)
+
                 x_prom = sum(self.historial_x) / len(self.historial_x)
                 y_prom = sum(self.historial_y) / len(self.historial_y)
-                ang_prom = sum(self.historial_ang) / len(self.historial_ang)
+                z_prom = sum(self.historial_z) / len(self.historial_z)
 
-                # Función para sanitizar: 
-                # 1. Convierte a int. 
-                # 2. Asegura que sea >= 0 (evita negativos).
-                # 3. Asegura que sea <= 65535 (evita desbordamientos).
-                def sanitizar(val):
-                    return max(0, min(int(val*100), 65535))
-                
-                # Escalamos para no perder decimales (ej: 10.55mm -> 1055)
-                x = sanitizar(x_prom)
-                y = sanitizar(y_prom)
-                ang = sanitizar(ang_prom)
-                
-                # Modbus NO entiende strings, así que convertimos el item a un ID
-                color_raw = datos.get('Color', 'Desconocido')
-                tipo_raw = datos.get('Tipo', 'Desconocido')
-                # Diccionario de conversión
-                #Mapeo de colores
-                mapeo_colores = {'Desconocido': 0, 'Blanco/Gris': 1, 'Negro': 2,
-                                  'Rojo': 3, 'Naranja': 4, 'Amarillo': 5, 'Verde': 6,
-                                   'Azul': 7, 'Violeta': 8 }
-                color_id = mapeo_colores.get(color_raw, 0)
-                #Mapeo de frutas
-                mapeo_tipos = {'Desconocido': 0, 'chayote': 1, 'manzana': 2,
-                                  'tomate': 3, 'zanahoria': 4 }
-                tipo_id = mapeo_tipos.get(tipo_raw, 0)
+                # Convertimos las coordenadas finales a pares de registros Modbus (Float 32bit)
+                palabras_x = self._convertir_a_palabras_float(x_prom)
+                palabras_y = self._convertir_a_palabras_float(y_prom)
+                palabras_z = self._convertir_a_palabras_float(z_prom)
 
-                # Escribimos en los registros 0, 1, 2, 3 y 4
-                self.client.write_registers(0, [x, y, ang, color_id, tipo_id])
-                #print("Datos enviados al PLC:")
-                #print(f"  X: {x}, Y: {y}, Ang: {ang}, Color ID: {color_id}, Tipo ID: {tipo_id}")
+                # ─────────────────────────────────────────────────────────────
+                # ESCRITURA FORZADA CON PAUSAS DE ESTABILIZACIÓN
+                # ─────────────────────────────────────────────────────────────
+                sleep_time=10
+
+                ok_x = self.client.write_multiple_registers(self.REG_WRITE_X, palabras_x)
+                self.msleep(sleep_time)  # Pausa de 30ms para que el procesador del SZGH procese el registro
+                
+                ok_y = self.client.write_multiple_registers(self.REG_WRITE_Y, palabras_y)
+                self.msleep(sleep_time)
+                
+                ok_z = self.client.write_multiple_registers(self.REG_WRITE_Z, palabras_z)
+                self.msleep(sleep_time)
+
+                # ─── REGISTRO DE TIEMPO EXITOSO ───
+                self.ultimo_envio_time = tiempo_actual
+
+                # Verificación de transmisión en la terminal
+                #print(f"[MODBUS TX] Éxito -> X: {ok_x} | Y: {ok_y} | Z: {ok_z}")
+                #print(f" -> Enviado a GV1-GV3 -> X: {x_prom:.2f} | Y: {y_prom:.2f} | Z: {z_prom:.2f}")
+
+                # Log de telemetría para supervisión en tiempo real
+                print(f"[SEGUIMIENTO] -> Desfase detectados: ΔX: {desfase_x:.1f}mm | ΔY: {desfase_y:.1f}mm")
+                print(f"              -> Trayectoria calculada: X: {x_prom:.2f} | Y: {y_prom:.2f} | Z: {z_prom:.2f}")
 
             except Exception as e:
-                print(f"Fallo al escribir en PLC: {e}")
+                print(f"Error en procesamiento analítico de coordenadas: {e}")
 
     def stop(self):
         self.is_running = False
@@ -813,7 +939,7 @@ class RobotHMI(QMainWindow):
         self.layout_modbus = QFormLayout() # Layout tipo formulario (Etiqueta | Entrada)
 
         # Campos de texto
-        self.txt_ip = QLineEdit("198.162.2.17")
+        self.txt_ip = QLineEdit("192.168.2.17")
         self.txt_puerto = QLineEdit("502") 
 
         # Botón de conexión
@@ -846,6 +972,48 @@ class RobotHMI(QMainWindow):
         self.control_panel.addStretch() # Espacio flexible para separar secciones
         self.main_layout.addLayout(self.control_panel, stretch=1)
 
+        # Layout para el Sistema de Testeo Manual Seguro
+        test_layout = QVBoxLayout()
+        self.lbl_test_titulo = QLabel("Panel de Pruebas (Sin Cámara)")
+        self.lbl_test_titulo.setStyleSheet("font-size: 14px; font-weight: bold; color: #E74C3C; margin-top: 5px;") # Rojo para advertir que es de prueba
+        test_layout.addWidget(self.lbl_test_titulo)
+
+        # Campos para simular los desfasajes en mm
+        form_test = QFormLayout()
+        self.txt_test_dx = QLineEdit("0.0")
+        self.txt_test_dy = QLineEdit("0.0")
+        self.txt_test_dz = QLineEdit("0.0")
+        
+        # Estilo para las cajas de texto
+        estilo_txt = "background-color: #333; color: white; font-weight: bold; border: 1px solid #555; padding: 3px;"
+        self.txt_test_dx.setStyleSheet(estilo_txt)
+        self.txt_test_dy.setStyleSheet(estilo_txt)
+        self.txt_test_dz.setStyleSheet(estilo_txt)
+
+        form_test.addRow(QLabel("Simular ΔX (mm):"), self.txt_test_dx)
+        form_test.addRow(QLabel("Simular ΔY (mm):"), self.txt_test_dy)
+        form_test.addRow(QLabel("Simular ΔZ (mm):"), self.txt_test_dz)
+        test_layout.addLayout(form_test)
+
+        # Botón para disparar el movimiento manual de prueba
+        self.btn_test_mover = QPushButton("Disparar Movimiento de Prueba")
+        self.btn_test_mover.setStyleSheet("background-color: #E74C3C; color: white; font-weight: bold; padding: 6px; border-radius: 4px;")
+        test_layout.addWidget(self.btn_test_mover)
+
+        # Añadir este grupo al panel de control
+        self.control_panel.addLayout(test_layout)
+
+        self.btn_test_mover.clicked.connect(self.ejecutar_movimiento_prueba)
+
+         # Separador visual
+        separator = QLabel()
+        separator.setFixedHeight(2)
+        separator.setStyleSheet("background-color: #555; margin: 10px 0;")
+        self.control_panel.addWidget(separator)
+        self.control_panel.addStretch() # Espacio flexible para separar secciones
+        self.main_layout.addLayout(self.control_panel, stretch=1)
+
+
         # Iniciar Hilo de Video
         self.hilo_video = VideoThread()
         self.hilo_video.change_pixmap_signal.connect(self.update_image)
@@ -856,6 +1024,8 @@ class RobotHMI(QMainWindow):
         self.hilo_modbus = ModbusThread()
         self.hilo_modbus.connection_result.connect(self.finalizar_conexion_modbus)
         self.hilo_video.data_signal.connect(self.hilo_modbus.enviar_datos)
+        # Conectamos la telemetría del robot a la función de la HMI
+        self.hilo_modbus.posicion_actual_hmi_signal.connect(self.actualizar_coordenadas_hmi)
 
         self.hilo_ia = IAThread()
         #El video le pasa el frame a la IA
@@ -865,15 +1035,31 @@ class RobotHMI(QMainWindow):
 
     def update_image(self, cv_img):
         
-        """Convierte imagen de OpenCV a formato de PyQt"""
-        rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        p = qt_img.scaled(self.video_label.size(), 
-                          Qt.AspectRatioMode.KeepAspectRatio, 
-                          Qt.TransformationMode.SmoothTransformation)
-        self.video_label.setPixmap(QPixmap.fromImage(p))
+        """Convierte imagen de OpenCV a formato de PyQt de forma eficiente sin fugas"""
+        try:
+            if cv_img is None:
+                return
+
+            # 1. Usamos Format_BGR888 directamente sobre cv_img.data
+            # Así nos ahorramos el cv2.cvtColor() que creaba una matriz extra en RAM
+            h, w, ch = cv_img.shape
+            bytes_per_line = ch * w
+            qt_img = QImage(cv_img.data, w, h, bytes_per_line, QImage.Format.Format_BGR888)
+            
+            # 2. Escalamos la imagen al tamaño del label
+            p = qt_img.scaled(self.video_label.size(), 
+                              Qt.AspectRatioMode.KeepAspectRatio, 
+                              Qt.TransformationMode.SmoothTransformation)
+            
+            # 3. Asignamos el Pixmap a la interfaz
+            self.video_label.setPixmap(QPixmap.fromImage(p))
+
+            # 4. LIMPIEZA EXPLÍCITA: Rompemos las referencias del frame en este ciclo
+            del qt_img
+            del p
+            
+        except Exception as e:
+            print(f"Error actualizando la imagen en el QLabel: {e}")
 
     def cambiar_camara(self):
         #Tomamos el nuevo ID de cámara del SpinBox
@@ -952,6 +1138,38 @@ class RobotHMI(QMainWindow):
         # Enviamos el offset al hilo de video en tiempo real si está corriendo
         if hasattr(self, 'hilo_video') and self.hilo_video.isRunning():
             self.hilo_video.set_luz_offset(valor)
+
+    def actualizar_coordenadas_hmi(self, posicion):
+        """Actualiza los componentes visuales de la interfaz con la posición en tiempo real del robot"""
+        self.lbl_robot_x.setText(f"RX: {posicion['X']:.2f} mm")
+        self.lbl_robot_y.setText(f"RY: {posicion['Y']:.2f} mm")
+        self.lbl_robot_z.setText(f"RZ: {posicion['Z']:.2f} mm")
+
+    def ejecutar_movimiento_prueba(self):
+        """Toma los valores simulados de la UI y los inyecta directamente al PLC de forma aislada"""
+        if hasattr(self, 'hilo_modbus') and self.hilo_modbus.is_running:
+            try:
+                # 1. Leer los desfasajes manuales escritos en la HMI
+                dx_simulado = float(self.txt_test_dx.text())
+                dy_simulado = float(self.txt_test_dy.text())
+                dz_simulado = float(self.txt_test_dz.text())
+                
+                # 2. Empaquetar en la estructura exacta que procesa el slot 'enviar_datos'
+                datos_simulados = {
+                    'X_mm': dx_simulado,
+                    'Y_mm': dy_simulado,
+                    'Z_mm': dz_simulado
+                }
+                
+                # 3. Invocar al slot del hilo Modbus. Aquí sí se calculan las variables absolutas GV
+                print(f"[DISPARO MANUAL] Inyectando desfasaje -> ΔX: {dx_simulado} mm, ΔY: {dy_simulado} mm, ΔZ: {dz_simulado} mm")
+                #self.hilo_modbus.enviar_datos(datos_simulados)
+                
+            except ValueError:
+                print("Error: Por favor ingresa números válidos en los campos de prueba.")
+        else:
+            print("Error: El PLC debe estar ONLINE para realizar la prueba de movimiento.")
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

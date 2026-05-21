@@ -34,8 +34,8 @@ if client.open():
     
     # Vamos a enviar el valor 5.5 a la variable GV5 (Registros Modbus 10 y 11)
     # Si quieres usar otra variable, por ejemplo GV10, usaría los registros 20 y 21.
-    numero_gv = 3
-    valor_a_enviar = 200
+    numero_gv = 1
+    valor_a_enviar = 700
     
     if escribir_float_szgh(client, numero_gv, valor_a_enviar):
         print("\n[ÉXITO]: ¡Estructura de memoria aceptada por el robot!")

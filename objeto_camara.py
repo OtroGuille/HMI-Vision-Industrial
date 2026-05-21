@@ -1,7 +1,6 @@
 import sys
 import os
 from ctypes import *
-import cv2
 import numpy as np
 
 # Configuración de DLLs nativas de iCentral (necesario para cargar MVSDKmd.dll)
@@ -57,7 +56,7 @@ class CamaraMarsIndustrial:
         self.inicializada = True
         print("[Mars SDK] ¡Cámara Mars lista y transmitiendo!")
         return True
-
+    
     def obtener_frame(self):
         """Captura el frame crudo, lo transforma a matriz NumPy BGR y libera el buffer de la cámara."""
         if not self.inicializada:
