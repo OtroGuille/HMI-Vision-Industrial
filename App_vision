@@ -16,6 +16,7 @@ from collections import deque
 from pyModbusTCP.client import ModbusClient
 
 import time
+import queue # Añadido para la optimización del hilo de IA
 
 import gc  # Garbage Collector nativo de Python
 
@@ -56,6 +57,9 @@ class VideoThread(QThread):
         super().__init__()
         self.running = True
         self.cap_index = CAMARA_POR_DEFECTO  # Valor por defecto inicial para la cámara
+
+        # Flag de debug para evitar copias innecesarias de frames en RAM
+        self.debug = False
 
         #Seccion de Vision
         self.px_to_mm = FACTOR_PX_MM #Factor de conversion de px a mm
@@ -163,11 +167,12 @@ class VideoThread(QThread):
                 ix, iy = det["centro"]
                 # Dibujamos un círculo pequeño donde la IA dice que hay algo
                 cv2.circle(frame, (ix, iy), 20, (255, 255, 0), 2)
-                cv2.putText(frame, f"IA detecto: {det['nombre']}", (ix, iy - 25), 
+                cv2.putText(frame, f"IA detecto: {det['nombre']}", (ix, iy - 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-        '''   
+        '''
 
-        frame_inicial = frame.copy() # Guardamos el frame original para dibujar los resultados al final
+        # OPTIMIZACIÓN: Solo hacemos copias si el modo debug está activo
+        frame_inicial = frame.copy() if self.debug else None
 
         # 1. Pipeline de procesamiento con visualización
         # -------BLOQUE DE CORRECCIÓN DE COLOR--------------
@@ -176,10 +181,10 @@ class VideoThread(QThread):
         b = cv2.multiply(b, B_GAIN)
         g = cv2.multiply(g, G_GAIN)
         r = cv2.multiply(r, R_GAIN)
-        
+
         frame_corregido = cv2.merge([b, g, r])
         frame_corregido = np.clip(frame_corregido, 0, 255).astype(np.uint8)
-        ganancias=frame_corregido.copy() # Guardamos el frame corregido para mostrarlo en el mosaico
+        ganancias = frame_corregido.copy() if self.debug else None # Guardamos el frame corregido para mostrarlo en el mosaico
         frame = frame_corregido
         # --------------------------------------------------
 
@@ -393,7 +398,7 @@ class VideoThread(QThread):
                 del locals()[var]
 
         # 2. Forzamos al recolector de basura a liberar la RAM de inmediato en este ciclo
-        gc.collect()
+        # gc.collect() # OPTIMIZACIÓN: Eliminada llamada forzada al GC para evitar micro-congelamientos (stop-the-world)
 
         return frame, datos
 
@@ -635,42 +640,49 @@ class ModbusThread(QThread):
 class IAThread(QThread):
     # Definimos la señal que enviará la lista de detecciones
     # Cada elemento de la lista será: {'nombre': str, 'centro': (x, y)}
-    deteccion_ia_signal = pyqtSignal(list) 
+    deteccion_ia_signal = pyqtSignal(list)
 
-    def __init__(self):
+    def __init__(self, frame_queue):
         super().__init__()
         # Cargamos el modelo
         self.model = YOLO(MODELO_YOLO)
-        self.frame_actual = None
-
-    def procesar_frame(self, frame):
-        """Método que recibe el frame desde el hilo de video"""
-        if not self.isRunning():
-            self.frame_actual = frame.copy() # Usamos .copy() para evitar conflictos de memoria
-            self.start()
+        self.frame_queue = frame_queue # Recibimos la cola de frames
+        self.running = True
 
     def run(self):
-        """Inferencia asíncrona"""
-        # Aplicamos el filtro de confianza de 0.8 
-        results = self.model.predict(self.frame_actual, conf=0.8, verbose=False)
-        lista_detecciones = []
+        """Bucle de inferencia continua (Consumer)"""
+        print("[IA Thread] Iniciando bucle de inferencia...")
+        while self.running:
+            try:
+                # Esperar por un frame en la cola (timeout para permitir salida limpia)
+                frame = self.frame_queue.get(timeout=1.0)
 
-        if results and len(results[0].boxes) > 0:
-            for box in results[0].boxes:
-                # Obtener nombre de la clase
-                cls = int(box.cls[0])
-                nombre = self.model.names[cls]
-                
-                # Obtener coordenadas del centro (x_centro, y_centro)
-                # xywh devuelve [x_center, y_center, width, height]
-                x_c, y_c, _, _ = box.xywh[0].tolist()
-                
-                lista_detecciones.append({
-                    "nombre": nombre, 
-                    "centro": (int(x_c), int(y_c))
-                })
-        
-        self.deteccion_ia_signal.emit(lista_detecciones)
+                # Inferencia
+                results = self.model.predict(frame, conf=0.8, verbose=False)
+                lista_detecciones = []
+
+                if results and len(results[0].boxes) > 0:
+                    for box in results[0].boxes:
+                        cls = int(box.cls[0])
+                        nombre = self.model.names[cls]
+                        x_c, y_c, _, _ = box.xywh[0].tolist()
+                        lista_detecciones.append({
+                            "nombre": nombre,
+                            "centro": (int(x_c), int(y_c))
+                        })
+
+                self.deteccion_ia_signal.emit(lista_detecciones)
+                self.frame_queue.task_done()
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Error en IAThread: {e}")
+
+    def stop(self):
+        self.running = False
+        self.quit()
+        self.wait()
 
 # --- CLASE PRINCIPAL DEL HMI ---
 class RobotHMI(QMainWindow):
@@ -1027,13 +1039,25 @@ class RobotHMI(QMainWindow):
         # Conectamos la telemetría del robot a la función de la HMI
         self.hilo_modbus.posicion_actual_hmi_signal.connect(self.actualizar_coordenadas_hmi)
 
-        self.hilo_ia = IAThread()
-        #El video le pasa el frame a la IA
-        self.hilo_video.enviar_a_ia_signal.connect(self.hilo_ia.procesar_frame)
-        #La IA le devuelve la lista de nombres y posiciones al video
+        self.ia_queue = queue.Queue(maxsize=1)
+        self.hilo_ia = IAThread(self.ia_queue)
+        # El video le pasa el frame a la cola de la IA
+        self.hilo_video.enviar_a_ia_signal.connect(self.enviar_frame_a_ia)
+        # La IA le devuelve la lista de nombres y posiciones al video
         self.hilo_ia.deteccion_ia_signal.connect(self.hilo_video.actualizar_lista_ia)
+        self.hilo_ia.start()
+
+    def enviar_frame_a_ia(self, frame):
+        """Sincroniza el frame del hilo de video con la cola de la IA"""
+        try:
+            # Usamos put_nowait para que si la IA está lenta, el video no se bloquee
+            # Simplemente descartamos el frame si la cola ya tiene uno
+            self.ia_queue.put_nowait(frame)
+        except queue.Full:
+            pass
 
     def update_image(self, cv_img):
+
         
         """Convierte imagen de OpenCV a formato de PyQt de forma eficiente sin fugas"""
         try:

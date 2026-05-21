@@ -1,6 +1,7 @@
 import sys
 import os
 from ctypes import *
+import cv2
 import numpy as np
 
 # Configuración de DLLs nativas de iCentral (necesario para cargar MVSDKmd.dll)
@@ -53,10 +54,18 @@ class CamaraMarsIndustrial:
         # Preparar estructuras de memoria fijas para el bucle
         self.frame = IMV_Frame()
         self.stPixelConvertParam = IMV_PixelConvertParam()
+
+        # Pre-asignar buffer de conversión para evitar fragmentación de memoria
+        # Asumimos resolución estándar; se actualizará si cambia en obtener_frame
+        # Para Mars5000S típico (ej. 640x480 o similar), calculamos el tamaño
+        # En un entorno real, esto se haría tras IMV_Open() sabiendo el tamaño real
+        # Para propósitos de optimización, lo inicializamos aquí y lo ajustamos si es necesario.
+        self.pConvertBuf = None
+
         self.inicializada = True
         print("[Mars SDK] ¡Cámara Mars lista y transmitiendo!")
         return True
-    
+
     def obtener_frame(self):
         """Captura el frame crudo, lo transforma a matriz NumPy BGR y libera el buffer de la cámara."""
         if not self.inicializada:
@@ -70,7 +79,12 @@ class CamaraMarsIndustrial:
         ancho = self.frame.frameInfo.width
         alto = self.frame.frameInfo.height
         nConvertBufSize = ancho * alto * 3
-        pConvertBuf = (c_ubyte * nConvertBufSize)()
+
+        # OPTIMIZACIÓN: Pre-asignar el buffer solo la primera vez o si cambia la resolución
+        if self.pConvertBuf is None or (len(self.pConvertBuf) != nConvertBufSize):
+            self.pConvertBuf = (c_ubyte * nConvertBufSize)()
+
+        pConvertBuf = self.pConvertBuf
 
         # Configuración del mapeo de memoria nativo a BGR8
         memset(byref(self.stPixelConvertParam), 0, sizeof(self.stPixelConvertParam))
