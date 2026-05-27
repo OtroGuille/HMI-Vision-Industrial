@@ -28,10 +28,10 @@ print("✓ Conectado\n")
 # Estos son los offsets que tu programa POSE_OFFSET lee
 # Cámbialos por los valores que necesites
 
-escribir_float_gv(client, 0, 10.0)   # GV0 = offset X en mm
-escribir_float_gv(client, 1, 10.0)   # GV1 = offset X en mm
-escribir_float_gv(client, 2, 0.0)    # GV2 = offset Y en mm
-escribir_float_gv(client, 3, 0.0)    # GV3 = offset Z en mm
+escribir_float_gv(client, 1, 2.0)   #cliente, gv_number=0, valor_float=10.0)
+#colores GV1
+#rosa GV1=1
+#cafe GV1=2
 
 print("\nCoordendas enviadas. El robot debería moverse si el programa está corriendo.")
 
