@@ -197,10 +197,10 @@ class ModbusThread(QThread):
         self.is_running = False
         self.modbus_queue = modbus_queue
 
-        #GV ocupan 2 registros cada una por ser float (32 bits), por eso el salto de 2 en las direcciones
-        self.GV0 = 0 # GV0
+        self.GV_DETECTOR = 0 # GV0: Detector de caja (1 = detectada)
         self.GV_COLOR = 2 # GV1: Color detectado (1 = rosa, 2 = marrón)
 
+        self.prev_gv1 = 0
         self.auto_mode = True
 
     def set_config(self, ip, port):
@@ -231,44 +231,34 @@ class ModbusThread(QThread):
                 self.connection_result.emit(True)
                 while self.is_running:
 
-                    # ─── LECTURA DIRECTA DE ENTRADA DIGITAL ───
-                    # 1. Leer el estado del sensor físico en DI2 (Dirección 2)
-                    bits = self.client.read_discrete_inputs(2, 1)
-                    #print(f"Lectura DI2 (Sensor de presencia): {bits}")
-                    
-                    if bits and len(bits) == 1:
-                        is_object_present = bits[0] 
+                    # Read GV0 (We read 2 registers because GV is 32-bit float)
+                    regs = self.client.read_holding_registers(self.GV_DETECTOR, 2)
+                    if regs and len(regs) == 2:
+                        # Convert the two 16-bit registers back to float to check the value
+                        raw_bytes = struct.pack('<HH', regs[0], regs[1])
+                        gv0_val = struct.unpack('<f', raw_bytes)[0]
 
-                        # Sincroniza el indicador visual de la HMI
+                        # Signal the HMI if an object is detected (GV1 == 1)
+                        is_object_present = (gv0_val == 1.0)
                         self.robot_ready_signal.emit(is_object_present)
 
-                        # 2. LEER EL ESTADO DEL ESCUDO (GV0)
-                        regs = self.client.read_holding_registers(self.GV0, 2)
-                        if regs and len(regs) == 2:
-                            raw_bytes = struct.pack('<HH', regs[0], regs[1])
-                            gv0_val = struct.unpack('<f', raw_bytes)[0]
+                        # RISING EDGE DETECTION: Only send when GV1 changes from 0 to 1
+                        if is_object_present and self.prev_gv1 == 0:
+                            if self.auto_mode:
+                                datos_recientes = None
+                                while not self.modbus_queue.empty():
+                                    try:
+                                        datos_recientes = self.modbus_queue.get_nowait()
+                                    except queue.Empty:
+                                        break
 
-                            #print(f"Estado GV0 (Escudo de captura): {gv0_val}")
-                            
-                            # ─── MODIFICACIÓN MÍNIMA: Cambiamos la condición del disparo ───
-                            # Dispara solo si hay caja presente físicamente Y el robot activó la bandera (GV0 == 1)
-                            if is_object_present and gv0_val == 1.0 :
-                                print(f"\n📦 [MODBUS] Captura autorizada por el Robot (GV0=1).")
-                                self.msleep(1000) # Breve pausa para asegurar que el robot haya procesado la captura
-                                if self.auto_mode:
-                                    datos_recientes = None
-                                    while not self.modbus_queue.empty():
-                                        try:
-                                            datos_recientes = self.modbus_queue.get_nowait()
-                                        except queue.Empty:
-                                            break
+                                if datos_recientes:
+                                    self._enviar_resultado_color(datos_recientes)
 
-                                    if datos_recientes:
-                                        self._enviar_resultado_color(datos_recientes)                         
+                        self.prev_gv1 = 1 if is_object_present else 0
 
-                    #Cambiar a 50
                     self.msleep(50)
-
+                    
             else:
                 self.connection_result.emit(False)
         except Exception as e:
@@ -298,43 +288,15 @@ class ModbusThread(QThread):
             self.client.close()
         self.quit()
 
-    def controlar_banda(self, estado):
-        """Envía el estado a la salida Y1 (Dirección 1) para arrancar o detener la banda"""
-        if self.client and self.client.is_open:
-            # Función 05 de Modbus TCP escribe un único Coil
-            # Dirección 1 = Y1 en el controlador SZGH
-            exito = self.client.write_single_coil(1, estado)
-            if exito:
-                print(f"[MODBUS] Banda Y1 modificada a: {'ENCENDIDO' if estado else 'APAGADO'}")
-            else:
-                print("[MODBUS ERROR] No se pudo cambiar el estado de la banda Y1")
-
-    def resetear_variables_globales(self):
-        """Pone en 0.0 las variables GV0, GV1, GV2, GV3 y GV4"""
-        if self.client and self.client.is_open:
-            print("[MODBUS] Reiniciando variables globales GV0 a GV4...")
-            # Limpiamos cada una de las 4 GVs (ocupan 2 registros Modbus cada una por ser float)
-            for i in range(5):
-                registro_real = i * 2
-                self._write_float_gv(registro_real, 0.0)
-                self.msleep(100)  # Breve pausa entre escrituras para asegurar que el robot las procese correctamente
-            # Reseteamos también el estado de control interno en Python
-            print("[MODBUS] Reseteo de variables completado con éxito.")
-
 class RobotHMI(QMainWindow):
     def __init__(self):
         super().__init__()
-
-
-        #Cabecera
         self.setWindowIcon(QIcon("ojo.jpg"))
         self.setWindowTitle("HMI Control de Calidad - Robot Vision")
         self.setGeometry(100, 100, 1000, 700)
         self.setStyleSheet("background-color: #1e1e1e; color: white;")
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-
-
         self.main_layout = QHBoxLayout(self.central_widget)
         self.video_label = QLabel()
         self.video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -425,12 +387,9 @@ class RobotHMI(QMainWindow):
         self.sld_o_posy.valueChanged.connect(self.actualizar_origen)
         self.control_panel.addLayout(org_layout)
         separator = QLabel()
-
         separator.setFixedHeight(2)
         separator.setStyleSheet("background-color: #555; margin: 10px 0;")
         self.control_panel.addWidget(separator)
-
-        # ─── SECCIÓN DE GANANCIA DE LUZ ───
         luz_layout = QVBoxLayout()
         self.lbl_luz = QLabel("Ganancia de Luz:")
         self.lbl_luz.setStyleSheet("font-size: 14px; font-weight: bold; color: white; margin-top: 5px;")
@@ -441,13 +400,10 @@ class RobotHMI(QMainWindow):
         luz_layout.addWidget(self.sld_luz)
         self.sld_luz.valueChanged.connect(self.cambiar_luminosidad)
         self.control_panel.addLayout(luz_layout)
-
         separator = QLabel()
         separator.setFixedHeight(2)
         separator.setStyleSheet("background-color: #555; margin: 10px 0;")
         self.control_panel.addWidget(separator)
-
-        # ─── SECCIÓN DE MODBUS TCP PARA CONTROLAR EL ROBOT ───
         self.group_modbus = QGroupBox("Comunicación Robot (Modbus TCP)")
         self.group_modbus.setStyleSheet("QGroupBox { font-weight: bold; font-size: 14px; color: white; margin-top: 20px; border: 1px solid #3d3d3d; border-radius: 5px; } QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; }")
         self.layout_modbus = QFormLayout()
@@ -481,25 +437,20 @@ class RobotHMI(QMainWindow):
         self.control_panel.addWidget(self.group_modbus)
         self.btn_conectar.clicked.connect(self.toggle_modbus)
 
-        separator = QLabel()
-        separator.setFixedHeight(2)
-        separator.setStyleSheet("background-color: #555; margin: 10px 0;")
-        self.control_panel.addWidget(separator)
-
         # Manual Test Section
         test_group = QGroupBox("Modo manual")
-        test_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 14px; color: white; margin-top: 20px; border: 1px solid #3d3d3d; border-radius: 5px; } QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; }")
+        test_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 14px; color: white; margin-top: 20px; border: 1px solid #3d3d3d; border-radius: 5px; padding-top: 20px; padding-bottom:10px }")
         test_layout = QVBoxLayout()
 
-        self.btn_test_pink = QPushButton("Eviar Rosa (GV1=1)")
+        self.btn_test_pink = QPushButton("Send Rosa (GV1=1)")
         self.btn_test_pink.setStyleSheet("background-color: #E91E63; color: white; font-weight: bold; padding: 8px; Height: 10px;")
         self.btn_test_pink.clicked.connect(lambda: self.hilo_modbus.manual_send_color(1))
 
-        self.btn_test_brown = QPushButton("Eviar Marron (GV1=2)")
+        self.btn_test_brown = QPushButton("Send Marron (GV1=2)")
         self.btn_test_brown.setStyleSheet("background-color: #795548; color: white; font-weight: bold; padding: 8px; Height: 10px;")
         self.btn_test_brown.clicked.connect(lambda: self.hilo_modbus.manual_send_color(2))
 
-        self.btn_test_unknown = QPushButton("Eviar Otro (GV1=0)")
+        self.btn_test_unknown = QPushButton("Send Otro (GV1=0)")
         self.btn_test_unknown.setStyleSheet("background-color: #607D8B; color: white; font-weight: bold; padding: 8px; Height: 10px;")
         self.btn_test_unknown.clicked.connect(lambda: self.hilo_modbus.manual_send_color(0))
 
@@ -513,34 +464,8 @@ class RobotHMI(QMainWindow):
         separator.setFixedHeight(2)
         separator.setStyleSheet("background-color: #555; margin: 10px 0;")
         self.control_panel.addWidget(separator)
-
-        # ─── SECCIÓN DE CONTROL BANDA ───
-        controladores_layout = QVBoxLayout()
-        # Botón para Control de la Banda Transportadora (Y1)
-        self.btn_banda = QPushButton("ENCENDER BANDA")
-        self.btn_banda.setCheckable(True)
-        self.btn_banda.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; }"
-                                     "QPushButton:checked { background-color: #F44336; }")
-        self.btn_banda.clicked.connect(self.toggle_banda)
-        controladores_layout.addWidget(self.btn_banda)
-
-        # Botón de Reinicio de GVs y Rearme
-        self.btn_reset_robot = QPushButton("REINICIO TOTAL (RESET)")
-        self.btn_reset_robot.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; }"
-                                           "QPushButton:checked { background-color: #F44336; }")
-        self.btn_reset_robot.clicked.connect(self.reiniciar_y_arrancar_hmi)
-        controladores_layout.addWidget(self.btn_reset_robot)
-
-        self.control_panel.addLayout(controladores_layout)
-
-        separator = QLabel()
-        separator.setFixedHeight(2)
-        separator.setStyleSheet("background-color: #555; margin: 10px 0;")
-        self.control_panel.addWidget(separator)
-
         self.control_panel.addStretch()
         self.main_layout.addLayout(self.control_panel, stretch=1)
-
         self.hilo_video = VideoThread()
         self.hilo_video.change_pixmap_signal.connect(self.update_image)
         self.hilo_video.data_signal.connect(self.actualizar_telemetria)
@@ -638,21 +563,6 @@ class RobotHMI(QMainWindow):
             self.lbl_luz.setText(f"Ganancia de Luz: {valor}")
         if hasattr(self, 'hilo_video') and self.hilo_video.isRunning():
             self.hilo_video.set_luz_offset(valor)
-
-    def toggle_banda(self):
-        # Si el botón queda presionado (Checked), encendemos la banda (True)
-        if self.central_widget.sender().isChecked():
-            self.btn_banda.setText("DETENER BANDA")
-            self.hilo_modbus.controlar_banda(True)
-        else:
-            self.btn_banda.setText("ENCENDER BANDA")
-            self.hilo_modbus.controlar_banda(False)
-
-
-    def reiniciar_y_arrancar_hmi(self):
-        # 1. Pone en 0 todas las variables de control y contadores del robot (GV0 a GV4)
-        self.hilo_modbus.resetear_variables_globales()
-        
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
